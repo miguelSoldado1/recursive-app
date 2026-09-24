@@ -516,6 +516,7 @@ function useAnimatedCamera(target: Camera, onRest?: () => void) {
   return camera;
 }
 
+const APP_NAME = "Drift";
 const DEFAULT_TINT = "hsl(232 62% 74%)";
 // A star, its orbit, and a warm moon: the solar-system rings in miniature. Lakebed serves no static
 // files, so the icons are attached to the document head at startup.
@@ -1071,6 +1072,11 @@ export function App() {
   useEffect(() => {
     installIcons();
   }, []);
+
+  // The tab names the artist you're orbiting, so it tells you where you are.
+  useEffect(() => {
+    document.title = `${cameraFocusedNode.label} · ${APP_NAME}`;
+  }, [cameraFocusedNode.label]);
 
   // The first click or key press anywhere unlocks audio; until then browsers keep the page silent.
   useEffect(() => {
