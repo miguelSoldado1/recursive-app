@@ -786,15 +786,6 @@ function Starfield({ camera }: { camera: Camera }) {
   return <canvas aria-hidden="true" className="starfield" ref={canvasRef} />;
 }
 
-function formatFans(fans?: number) {
-  if (!fans) {
-    return "Deezer artist";
-  }
-
-  const compact = fans >= 1_000_000 ? `${(fans / 1_000_000).toFixed(fans >= 10_000_000 ? 0 : 1)}M` : fans >= 1000 ? `${(fans / 1000).toFixed(fans >= 10_000 ? 0 : 1)}K` : String(fans);
-  return `${compact.replace(".0", "")} ${fans === 1 ? "fan" : "fans"}`;
-}
-
 const PREVIEW_VOLUME = 0.7;
 // Drift (radio mode): hop to a new artist when each clip ends. The fallbacks keep it moving when
 // there's no audio to wait for, and the budget pauses long sessions before they eat the daily limit.
@@ -2604,12 +2595,10 @@ export function App() {
           animation: panel-rise 220ms var(--ease-graph) both;
         }
 
-        .shortcuts-eyebrow {
-          margin: 0 0 10px;
-          color: var(--dust);
-          font: 500 10px/1 var(--font-mono);
-          letter-spacing: 0.18em;
-          text-transform: uppercase;
+        .shortcuts-title {
+          margin: 0 0 12px;
+          color: var(--ink);
+          font: 600 13px/1.2 var(--font-ui);
         }
 
         .shortcuts-list {
@@ -2803,7 +2792,7 @@ export function App() {
           pointer-events: none;
         }
 
-        .sound-eyebrow-drift {
+        .sound-eyebrow.sound-eyebrow-drift {
           color: var(--aura);
         }
 
@@ -2847,9 +2836,7 @@ export function App() {
 
         .sound-eyebrow {
           color: var(--dust);
-          font: 500 9.5px/1 var(--font-mono);
-          letter-spacing: 0.18em;
-          text-transform: uppercase;
+          font: 500 11px/1 var(--font-ui);
         }
 
         .sound-title {
@@ -3113,9 +3100,7 @@ export function App() {
 
         .artist-search-result-meta {
           color: var(--dust);
-          font: 500 10px/1 var(--font-mono);
-          letter-spacing: 0.16em;
-          text-transform: uppercase;
+          font: 500 12px/1 var(--font-ui);
         }
 
         .load-error {
@@ -3427,7 +3412,7 @@ export function App() {
 
       {showShortcuts ? (
         <div aria-label="Keyboard shortcuts" className="shortcuts" role="dialog">
-          <p className="shortcuts-eyebrow">Keyboard</p>
+          <p className="shortcuts-title">Keyboard shortcuts</p>
           <dl className="shortcuts-list">
             {[
               ["← → ↑ ↓", "Move between orbiting artists"],
@@ -3515,7 +3500,7 @@ export function App() {
                 </span>
                 <span className="artist-search-result-copy">
                   <span className="artist-search-result-name">{artist.name}</span>
-                  <span className="artist-search-result-meta">{artist.id === coreArtistId ? "Current start" : formatFans(artist.fans)}</span>
+                  {artist.id === coreArtistId ? <span className="artist-search-result-meta">Current start</span> : null}
                 </span>
               </button>
             ))}
