@@ -546,48 +546,17 @@ const DEEZER_MARK = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAA
 const tintCache = new Map<string, string | null>();
 const tintListeners = new Set<() => void>();
 
-function proceduralHues(seed: string) {
-  const hash = hashText(seed);
-  const hue = hash % 360;
+// A neutral silver glow for artists without a photo, like the grey placeholders streaming apps use.
+const VINYL_TINT = "hsl(240 6% 70%)";
 
-  return { hash, hue, accent: (hue + 20 + ((hash >>> 8) % 60)) % 360 };
-}
-
-function proceduralTint(seed: string) {
-  return `hsl(${proceduralHues(seed).accent} 62% 66%)`;
-}
-
-// Artists without a photo become a small generated world (a banded gas giant or a cratered moon),
-// seeded by their id so the same artist always looks the same.
-function ProceduralPlanet({ seed }: { seed: string }) {
-  const { hash, hue, accent } = proceduralHues(seed);
-  const isGasGiant = (hash >>> 14) % 3 !== 0;
-  let background: string;
-
-  if (isGasGiant) {
-    const tilt = -24 + ((hash >>> 4) % 48);
-    const storm = (hash >>> 20) % 2 === 0;
-    const stormX = 30 + ((hash >>> 22) % 40);
-    const stormY = 35 + ((hash >>> 25) % 30);
-    background = [
-      storm ? `radial-gradient(9% 6% at ${stormX}% ${stormY}%, hsl(${accent} 62% 70% / 0.85), hsl(${accent} 50% 50% / 0.35) 60%, transparent 100%)` : "",
-      `radial-gradient(120% 70% at 30% 30%, hsl(${accent} 70% 72% / 0.22), transparent 60%)`,
-      `repeating-linear-gradient(${tilt}deg, hsl(${hue} 40% 26%) 0%, hsl(${accent} 46% 42%) 5%, hsl(${hue} 36% 33%) 9%, hsl(${accent} 40% 56%) 12%, hsl(${hue} 42% 28%) 17%, hsl(${hue} 40% 26%) 24%)`
-    ]
-      .filter(Boolean)
-      .join(", ");
-  } else {
-    const craters = Array.from({ length: 4 }, (_, index) => {
-      const bits = hash >>> (index * 6);
-      const x = 22 + (bits % 56);
-      const y = 22 + ((bits >>> 3) % 56);
-      const radius = 6 + ((bits >>> 2) % 9);
-      return `radial-gradient(circle at ${x}% ${y}%, hsl(${hue} 22% 16% / 0.55) 0 ${radius}%, hsl(${hue} 24% 72% / 0.2) ${radius + 1}%, transparent ${radius + 3}%)`;
-    });
-    background = [...craters, `radial-gradient(circle at 40% 35%, hsl(${hue} 16% 54%), hsl(${hue} 22% 24%) 78%)`].join(", ");
-  }
-
-  return <span aria-hidden="true" className={`planet-procedural${isGasGiant ? " planet-procedural-gas" : ""}`} style={{ background }} />;
+// Artists without a photo get a plain grey vinyl record. The label turns; the sheen stays put like a reflection.
+function VinylRecord() {
+  return (
+    <span aria-hidden="true" className="vinyl">
+      <span className="vinyl-label" />
+      <span className="vinyl-sheen" />
+    </span>
+  );
 }
 
 function shiftHue(tint: string, degrees: number) {
@@ -1034,6 +1003,7 @@ export function App() {
   const searchRequestIdRef = useRef(0);
   const rootLoadRequestIdRef = useRef(0);
   const artistSearchInputRef = useRef<HTMLInputElement>(null);
+  const artistPickerRef = useRef<HTMLFormElement>(null);
   const focusedNode = tree[focusId] ?? rootNode;
   const cameraFocusedNode = tree[cameraFocusId] ?? focusedNode;
   const isTraveling = focusId !== cameraFocusId;
@@ -1050,7 +1020,7 @@ export function App() {
   const renderedNodes = loadedNodes;
   const tintFor = useTints(renderedNodes.map((node) => node.imageUrl).filter((url): url is string => Boolean(url)));
   const route = useMemo(() => routeTo(tree, cameraFocusedNode), [tree, cameraFocusedNode]);
-  const aura = cameraFocusedNode.imageUrl ? tintFor(cameraFocusedNode.imageUrl) : proceduralTint(cameraFocusedNode.artistId);
+  const aura = cameraFocusedNode.imageUrl ? tintFor(cameraFocusedNode.imageUrl) : VINYL_TINT;
   const cameraDriftX = (CENTER - camera.x) / camera.scale - CENTER;
   const cameraDriftY = (CENTER - camera.y) / camera.scale - CENTER;
   const engineRef = useRef<PreviewEngine>();
@@ -1072,6 +1042,25 @@ export function App() {
   useEffect(() => {
     installIcons();
   }, []);
+
+  // Close the search results when a click lands anywhere outside the search box.
+  useEffect(() => {
+    if (!isArtistPickerOpen) {
+      return;
+    }
+
+    function handlePointerDown(event: PointerEvent) {
+      if (!artistPickerRef.current?.contains(event.target as Node)) {
+        setIsArtistPickerOpen(false);
+      }
+    }
+
+    document.addEventListener("pointerdown", handlePointerDown);
+
+    return () => {
+      document.removeEventListener("pointerdown", handlePointerDown);
+    };
+  }, [isArtistPickerOpen]);
 
   // The tab names the artist you're orbiting, so it tells you where you are.
   useEffect(() => {
@@ -1553,7 +1542,7 @@ export function App() {
     const worldDiameter = (radius / cameraScale) * 2;
     const style = {
       ...nodeStyle(node, radius, cameraScale),
-      "--planet": node.imageUrl ? tintFor(node.imageUrl) : proceduralTint(node.artistId),
+      "--planet": node.imageUrl ? tintFor(node.imageUrl) : VINYL_TINT,
       "--emerge-x": parent ? `${(((parent.x - node.x) / worldDiameter) * 100).toFixed(1)}%` : "0%",
       "--emerge-y": parent ? `${(((parent.y - node.y) / worldDiameter) * 100).toFixed(1)}%` : "0%"
     };
@@ -1586,11 +1575,13 @@ export function App() {
               type="button"
             >
               {node.imageUrl ? (
-                <img alt="" className="planet-image" crossOrigin="anonymous" draggable={false} src={node.imageUrl} />
+                <>
+                  <img alt="" className="planet-image" crossOrigin="anonymous" draggable={false} src={node.imageUrl} />
+                  <span aria-hidden="true" className="planet-shade" />
+                </>
               ) : (
-                <ProceduralPlanet seed={node.artistId} />
+                <VinylRecord />
               )}
-              <span aria-hidden="true" className="planet-shade" />
             </button>
             {isLoading ? (
               <span aria-hidden="true" className="satellite-orbit">
@@ -1929,16 +1920,42 @@ export function App() {
           transition: filter 420ms ease;
         }
 
-        .planet-procedural {
+        .vinyl {
           position: absolute;
           inset: 0;
           border-radius: 50%;
           pointer-events: none;
+          background:
+            radial-gradient(circle, transparent 0 30%, rgba(255, 255, 255, 0.03) 30.5% 31%, transparent 31.5%),
+            repeating-radial-gradient(circle, #111116 0 1.2%, #15151b 1.2% 2.1%),
+            #0f0f14;
+          box-shadow: inset 0 0 0 1px rgba(238, 234, 248, 0.06);
         }
 
-        .planet-procedural-gas {
-          filter: blur(0.5px);
-          transform: scale(1.12);
+        .vinyl-label {
+          position: absolute;
+          inset: 34%;
+          border-radius: 50%;
+          background: radial-gradient(circle, #121214 0 9%, transparent 10%), #535358;
+          box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.25);
+          animation: node-spin 5s linear infinite;
+        }
+
+        .vinyl-label::after {
+          content: "";
+          position: absolute;
+          inset: 18%;
+          border: 1.5px solid transparent;
+          border-top-color: rgba(255, 255, 255, 0.22);
+          border-radius: 50%;
+          transform: rotate(-30deg);
+        }
+
+        .vinyl-sheen {
+          position: absolute;
+          inset: 0;
+          border-radius: 50%;
+          background: conic-gradient(from 20deg, transparent 0 10%, rgba(255, 255, 255, 0.07) 14%, transparent 20% 50%, rgba(255, 255, 255, 0.05) 64%, transparent 70%);
         }
 
         .planet-shade {
@@ -2620,6 +2637,7 @@ export function App() {
           .node-float,
           .node-emerge,
           .corona,
+          .vinyl-label,
           .nebula,
           .orbit-ring,
           .artist-search-panel {
@@ -2813,7 +2831,21 @@ export function App() {
         Deezer
       </p>
 
-      <form className="artist-picker" onSubmit={handleArtistSearchSubmit}>
+      <form
+        className="artist-picker"
+        onFocusOut={() => {
+          // Keyboard users tabbing out of the search should close the results too. Browsers don't always
+          // report where focus went, so check once it has landed.
+          window.setTimeout(() => {
+            const active = document.activeElement;
+            if (active && active !== document.body && !artistPickerRef.current?.contains(active)) {
+              setIsArtistPickerOpen(false);
+            }
+          }, 0);
+        }}
+        onSubmit={handleArtistSearchSubmit}
+        ref={artistPickerRef}
+      >
         <label className="sr-only" htmlFor="core-artist-search">
           Start from another artist
         </label>
@@ -2860,7 +2892,7 @@ export function App() {
                 type="button"
               >
                 <span className="artist-search-result-media">
-                  {artist.imageUrl ? <img alt="" className="artist-search-result-image" crossOrigin="anonymous" draggable={false} src={artist.imageUrl} /> : <ProceduralPlanet seed={artist.id} />}
+                  {artist.imageUrl ? <img alt="" className="artist-search-result-image" crossOrigin="anonymous" draggable={false} src={artist.imageUrl} /> : <VinylRecord />}
                 </span>
                 <span className="artist-search-result-copy">
                   <span className="artist-search-result-name">{artist.name}</span>
