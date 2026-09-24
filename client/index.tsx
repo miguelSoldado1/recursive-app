@@ -796,6 +796,18 @@ function formatFans(fans?: number) {
 }
 
 const PREVIEW_VOLUME = 0.7;
+// Drift (radio mode): hop to a new artist when each clip ends. The fallbacks keep it moving when
+// there's no audio to wait for, and the budget pauses long sessions before they eat the daily limit.
+// A stop lasts one clip. Muting doesn't change that: the clip keeps its timeline silently, and
+// unmuting resumes it where that timeline is, so sound on/off never moves the hop.
+const DRIFT_CLIP_MS = 30 * 1000;
+const DRIFT_STALL_GRACE_MS = 8 * 1000;
+const DRIFT_MUTATION_BUDGET = 300;
+// What a stop is expected to last before its clip has started (a 30-second preview plus load time).
+const DRIFT_AUDIBLE_ESTIMATE_MS = 31 * 1000;
+// Time constants for the ring: the head follows progress quickly; the tail sweeps a finished lap away.
+const DRIFT_RING_HEAD_SECONDS = 0.18;
+const DRIFT_RING_TAIL_SECONDS = 0.32;
 const PREVIEW_FADE_IN_SECONDS = 1.4;
 const PREVIEW_FADE_OUT_SECONDS = 0.9;
 const PREVIEW_REFRESH_MARGIN_MS = 60 * 1000;
@@ -962,7 +974,7 @@ class PreviewEngine {
     return true;
   }
 
-  async play(url: string, onEnded: () => void) {
+  async play(url: string, onEnded: () => void, startAtSeconds = 0) {
     if (!this.context) {
       return false;
     }
@@ -977,7 +989,8 @@ class PreviewEngine {
         onEnded();
       }
     };
-    incoming.audio.src = url;
+    // A media fragment starts playback part-way through the clip without a seek after loading.
+    incoming.audio.src = startAtSeconds > 0.5 ? `${url}#t=${startAtSeconds.toFixed(1)}` : url;
 
     try {
       await incoming.audio.play();
@@ -996,6 +1009,12 @@ class PreviewEngine {
   stop() {
     this.playToken += 1;
     this.decks.forEach((deck) => this.fadeOut(deck));
+  }
+
+  // Seconds left in the clip that's playing, or undefined when nothing is playing yet.
+  remainingSeconds() {
+    const audio = this.decks[this.activeDeck]?.audio;
+    return audio && !audio.paused && Number.isFinite(audio.duration) && audio.duration > 0 ? Math.max(0, audio.duration - audio.currentTime) : undefined;
   }
 
   readLevels(): AudioLevels {
@@ -1043,6 +1062,16 @@ class PreviewEngine {
       gain.gain.linearRampToValueAtTime(target, now + seconds);
     }
   }
+}
+
+function DriftIcon() {
+  return (
+    <svg aria-hidden="true" fill="none" height="16" viewBox="0 0 16 16" width="16">
+      <circle cx="4" cy="11.5" fill="currentColor" r="1.6" />
+      <path d="M5.8 10.2C7.4 6.6 9.6 4.8 12.6 4.4" stroke="currentColor" stroke-dasharray="1.6 1.8" stroke-linecap="round" stroke-width="1.4" />
+      <path d="M10.6 2.8l2.4 1.6-1.6 2.3" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.4" />
+    </svg>
+  );
 }
 
 function SoundIcon({ muted }: { muted: boolean }) {
@@ -1125,6 +1154,18 @@ export function App() {
   const [audioUnlocked, setAudioUnlocked] = useState(false);
   const [nowPlaying, setNowPlaying] = useState<string | undefined>();
   const [previewRefreshCount, setPreviewRefreshCount] = useState(0);
+  const [driftOn, setDriftOn] = useState(false);
+  const [driftNotice, setDriftNotice] = useState<string | undefined>();
+  const driftOnRef = useRef(false);
+  const driftNextRef = useRef<() => boolean>(() => false);
+  // One clock per stop: when it began, when the hop is expected, and which lap of the ring it is.
+  const driftStayRef = useRef({ nodeId: "", startedAt: 0, endsAt: 0, lap: 0 });
+  const soundOnRef = useRef(soundOn);
+  soundOnRef.current = soundOn;
+  const visitedArtistIdsRef = useRef(new Set<string>());
+  const mutationCountRef = useRef(0);
+  const driftStartMutationsRef = useRef(0);
+  driftOnRef.current = driftOn;
   const playingNode = cameraFocusedNode;
   const playingPreviews = playingNode.previews;
   // Keyed by URL so an identical list arriving again (e.g. a re-sent query) doesn't restart the track.
@@ -1213,6 +1254,7 @@ export function App() {
       setNowPlaying(undefined);
       const nodeId = playingNode.id;
       const artistId = playingNode.artistId;
+      mutationCountRef.current += 1;
       void loadArtistPreviews(artistId)
         .then((result) => {
           if (result.ok) {
@@ -1228,7 +1270,7 @@ export function App() {
 
     let cancelled = false;
 
-    function playTrack(index: number, failures: number) {
+    function playTrack(index: number, failures: number, startAtSeconds = 0) {
       const tracks = playingPreviews ?? [];
       const track = tracks[index % tracks.length];
       if (!track || cancelled) {
@@ -1237,11 +1279,16 @@ export function App() {
 
       setNowPlaying(track.title);
       void engine!
-        .play(track.url, () => {
-          if (!cancelled) {
-            playTrack(index + 1, 0);
-          }
-        })
+        .play(
+          track.url,
+          () => {
+            // While drifting, a finished clip is the cue to move on; otherwise keep cycling this artist.
+            if (!cancelled && !(driftOnRef.current && driftNextRef.current())) {
+              playTrack(index + 1, 0);
+            }
+          },
+          startAtSeconds
+        )
         .then((started) => {
           if (!started && !cancelled) {
             // Skip a clip that won't load; give up quietly once every clip has failed.
@@ -1254,7 +1301,10 @@ export function App() {
         });
     }
 
-    playTrack(0, 0);
+    // Sound coming back on part-way through a drift stop picks the clip up where its silent timeline is.
+    const stay = driftStayRef.current;
+    const resuming = driftOnRef.current && stay.nodeId === playingNode.id && Date.now() - stay.startedAt > 1500;
+    playTrack(0, 0, resuming ? Math.max(0, (DRIFT_CLIP_MS - (stay.endsAt - Date.now())) / 1000) : 0);
 
     return () => {
       cancelled = true;
@@ -1302,6 +1352,93 @@ export function App() {
       [0, 1, 2].forEach((index) => element.style.setProperty(`--band-${index}`, "0"));
     };
   }, [nowPlaying]);
+
+  useEffect(() => {
+    visitedArtistIdsRef.current.add(cameraFocusedNode.artistId);
+  }, [cameraFocusedNode.artistId]);
+
+  // A stop starts when drift is switched on or the camera sets off for a new artist. Toggling sound
+  // mid-stop only changes when the stop is expected to end, never when it started.
+  useEffect(() => {
+    if (!driftOn) {
+      return;
+    }
+
+    const startedAt = Date.now();
+    driftStayRef.current = {
+      nodeId: cameraFocusedNode.id,
+      startedAt,
+      endsAt: startedAt + DRIFT_AUDIBLE_ESTIMATE_MS,
+      lap: driftStayRef.current.lap + 1
+    };
+  }, [driftOn, cameraFocusedNode.id]);
+
+  // Clips normally end the stop; this timer covers silence (muted, no preview) and stalled playback.
+  useEffect(() => {
+    if (!driftOn || isTraveling) {
+      return;
+    }
+
+    // Muted (or no preview): hop when the clip would have ended. Audible: the clip ending triggers the
+    // hop, so this only catches playback that stalled.
+    const audible = soundOn && audioUnlocked && (playingPreviews?.length ?? 0) > 0;
+    const due = driftStayRef.current.endsAt + (audible ? DRIFT_STALL_GRACE_MS : 0);
+    const timeout = window.setTimeout(() => driftNextRef.current(), Math.max(500, due - Date.now()));
+
+    return () => {
+      window.clearTimeout(timeout);
+    };
+  }, [driftOn, isTraveling, cameraFocusedNode.id, soundOn, audioUnlocked, playingPreviewsKey]);
+
+  // The drift button's ring fills toward the next hop. Positions are tracked as "laps + progress" so a
+  // hop continues around the circle: the head starts the next lap from the top while the tail sweeps
+  // the finished lap away. Both ease toward their targets, so source changes glide instead of jump.
+  useEffect(() => {
+    const element = cosmosRef.current;
+    if (!element || !driftOn) {
+      return;
+    }
+
+    let head = driftStayRef.current.lap;
+    let tail = head;
+    let last = performance.now();
+    let frame = 0;
+
+    function tick(now: number) {
+      const dt = Math.min(0.1, (now - last) / 1000);
+      last = now;
+      const stay = driftStayRef.current;
+      const clock = Date.now();
+      const remaining = soundOnRef.current ? engineRef.current?.remainingSeconds() : undefined;
+      if (remaining !== undefined) {
+        stay.endsAt = clock + remaining * 1000;
+      }
+
+      const progress = Math.min(1, Math.max(0, (clock - stay.startedAt) / Math.max(1000, stay.endsAt - stay.startedAt)));
+      head += (stay.lap + progress - head) * (1 - Math.exp(-dt / DRIFT_RING_HEAD_SECONDS));
+      tail += (stay.lap - tail) * (1 - Math.exp(-dt / DRIFT_RING_TAIL_SECONDS));
+      const length = Math.min(1, Math.max(0, head - tail));
+      element!.style.setProperty("--drift-from", `${((tail % 1) * 360).toFixed(1)}deg`);
+      element!.style.setProperty("--drift-length", length.toFixed(4));
+      frame = requestAnimationFrame(tick);
+    }
+
+    frame = requestAnimationFrame(tick);
+
+    return () => {
+      cancelAnimationFrame(frame);
+      element.style.setProperty("--drift-length", "0");
+    };
+  }, [driftOn]);
+
+  useEffect(() => {
+    if (!driftNotice) {
+      return;
+    }
+
+    const timeout = window.setTimeout(() => setDriftNotice(undefined), 8000);
+    return () => window.clearTimeout(timeout);
+  }, [driftNotice]);
 
   function handleSoundPointerDown(event: PointerEvent) {
     // Handle unlocking here so the window listener doesn't also treat this press as a toggle.
@@ -1360,6 +1497,7 @@ export function App() {
       void (async () => {
         let result: ArtistSearchResult;
         try {
+          mutationCountRef.current += 1;
           result = await searchArtists(term);
         } catch (error) {
           result = {
@@ -1457,6 +1595,7 @@ export function App() {
           }
 
           started = true;
+          mutationCountRef.current += 1;
           loadRelatedArtists(artistId).then((result) => {
             if (result.ok) {
               writeCachedNeighborhood(artistId, result.data);
@@ -1561,10 +1700,84 @@ export function App() {
     }
   }
 
-  function focusNode(nodeId: string) {
+  function stopDrift(notice?: string) {
+    driftOnRef.current = false;
+    setDriftOn(false);
+    setDriftNotice(notice);
+  }
+
+  function startDrift() {
+    if (engineRef.current?.unlock()) {
+      setAudioUnlocked(true);
+    }
+
+    // Drift is a listening mode, so switching it on also switches the previews on.
+    setSoundOn(true);
+    writeSoundPreference(true);
+    driftOnRef.current = true;
+    driftStartMutationsRef.current = mutationCountRef.current;
+    setDriftNotice(undefined);
+    setDriftOn(true);
+  }
+
+  function toggleDrift() {
+    if (driftOnRef.current) {
+      stopDrift();
+    } else {
+      startDrift();
+    }
+  }
+
+  // Pick the next stop: somewhere not yet visited this session if possible, leaning toward the closest
+  // matches (earlier children), and never into a known dead end while other options exist.
+  driftNextRef.current = () => {
+    if (!driftOnRef.current || isTraveling) {
+      return false;
+    }
+
+    if (mutationCountRef.current - driftStartMutationsRef.current >= DRIFT_MUTATION_BUDGET) {
+      stopDrift("Drift paused to save today's requests. Turn it on again to keep going.");
+      return false;
+    }
+
+    const children = getChildren(tree, focusedNode);
+    if (children.length === 0) {
+      if (focusedNode.childrenStatus === "idle" || focusedNode.childrenStatus === "loading") {
+        window.setTimeout(() => driftNextRef.current(), 1500);
+        return true;
+      }
+
+      if (focusedNode.parentId) {
+        focusNode(focusedNode.parentId, { fromDrift: true });
+        return true;
+      }
+
+      stopDrift(`Drift stopped: ${focusedNode.label} has no related artists.`);
+      return false;
+    }
+
+    const isDeadEnd = (node: TreeNode) => node.childrenStatus === "loaded" && getChildren(tree, node).length === 0;
+    const open = children.filter((child) => !isDeadEnd(child));
+    const reachable = open.length > 0 ? open : children;
+    const unvisited = reachable.filter((child) => !visitedArtistIdsRef.current.has(child.artistId));
+    const pool = unvisited.length > 0 ? unvisited : reachable;
+    const weights = pool.map((child) => 1 / (child.childIndex + 1));
+    let roll = Math.random() * weights.reduce((total, weight) => total + weight, 0);
+    const next = pool.find((_, index) => (roll -= weights[index]) <= 0) ?? pool[pool.length - 1];
+
+    focusNode(next.id, { fromDrift: true });
+    return true;
+  };
+
+  function focusNode(nodeId: string, options: { fromDrift?: boolean } = {}) {
     const node = tree[nodeId];
     if (!node || isTraveling) {
       return;
+    }
+
+    // Choosing a destination yourself takes the wheel back from drift.
+    if (!options.fromDrift) {
+      stopDrift();
     }
 
     if (nodeId === cameraFocusId) {
@@ -1610,6 +1823,7 @@ export function App() {
   }
 
   async function chooseCoreArtist(artist: ArtistSummary) {
+    stopDrift();
     const requestId = rootLoadRequestIdRef.current + 1;
     rootLoadRequestIdRef.current = requestId;
     pendingLoadsRef.current.clear();
@@ -1636,6 +1850,10 @@ export function App() {
     let result: ArtistNeighborhoodResult;
     const cachedRoot = readCachedNeighborhood(artist.id);
     try {
+      if (!cachedRoot) {
+        mutationCountRef.current += 1;
+      }
+
       result = cachedRoot ? { ok: true, data: cachedRoot } : await loadRootArtist(artist.id);
       if (result.ok && !cachedRoot) {
         writeCachedNeighborhood(artist.id, result.data);
@@ -1759,6 +1977,7 @@ export function App() {
 
     if (arrow) {
       event.preventDefault();
+      stopDrift();
       if (!isTraveling) {
         moveSelection(arrow);
       }
@@ -1776,6 +1995,8 @@ export function App() {
       }
     } else if (event.key === "m" || event.key === "M") {
       handleSoundClick();
+    } else if (event.key === "d" || event.key === "D") {
+      toggleDrift();
     } else if (event.key === "/") {
       event.preventDefault();
       focusArtistSearchInput();
@@ -2556,6 +2777,42 @@ export function App() {
           outline-offset: 3px;
         }
 
+        .drift-button {
+          position: relative;
+          margin-left: -3px;
+          color: rgba(238, 234, 248, 0.72);
+        }
+
+        .drift-button-on {
+          border-color: color-mix(in oklab, var(--aura) 45%, transparent);
+          color: var(--aura);
+        }
+
+        .drift-button-on::before {
+          content: "";
+          position: absolute;
+          inset: -3px;
+          border-radius: 50%;
+          background: conic-gradient(
+            from var(--drift-from, 0deg),
+            var(--aura) 0 calc(var(--drift-length, 0) * 1turn),
+            rgba(238, 234, 248, 0.08) calc(var(--drift-length, 0) * 1turn)
+          );
+          -webkit-mask: radial-gradient(circle closest-side, transparent calc(100% - 2px), #000 calc(100% - 1.5px));
+          mask: radial-gradient(circle closest-side, transparent calc(100% - 2px), #000 calc(100% - 1.5px));
+          pointer-events: none;
+        }
+
+        .sound-eyebrow-drift {
+          color: var(--aura);
+        }
+
+        .sound-note {
+          max-width: 240px;
+          color: rgba(238, 234, 248, 0.72);
+          font: 500 12px/1.35 var(--font-ui);
+        }
+
         .sound-bars {
           height: 14px;
           display: flex;
@@ -2991,7 +3248,7 @@ export function App() {
           }
 
           .hud-route {
-            max-width: calc(100vw - 80px);
+            max-width: calc(100vw - 124px);
             top: max(16px, env(safe-area-inset-top));
             left: 16px;
           }
@@ -3134,16 +3391,27 @@ export function App() {
             <SoundIcon muted={!soundOn} />
           )}
         </button>
+        <button
+          aria-label={driftOn ? "Stop drifting" : "Drift: travel on by itself"}
+          aria-pressed={driftOn}
+          className={`sound-button drift-button${driftOn ? " drift-button-on" : ""}`}
+          onClick={toggleDrift}
+          onPointerDown={handleSoundPointerDown}
+          title={driftOn ? "Stop drifting (D)" : "Drift (D)"}
+          type="button"
+        >
+          <DriftIcon />
+        </button>
         <span aria-live="polite" className="sound-copy">
-          {!soundOn ? (
+          {driftOn ? <span className="sound-eyebrow sound-eyebrow-drift">Drifting</span> : nowPlaying && soundOn ? <span className="sound-eyebrow">Now playing</span> : null}
+          {driftNotice && !driftOn ? (
+            <span className="sound-note">{driftNotice}</span>
+          ) : !soundOn ? (
             <span className="sound-title">Previews muted</span>
           ) : !audioUnlocked ? (
             <span className="sound-title">Play previews</span>
           ) : nowPlaying ? (
-            <>
-              <span className="sound-eyebrow">Now playing</span>
-              <span className="sound-title">{nowPlaying}</span>
-            </>
+            <span className="sound-title">{nowPlaying}</span>
           ) : playingPreviews && playingPreviews.length === 0 ? (
             <span className="sound-title">No preview for {playingNode.label}</span>
           ) : (
@@ -3167,6 +3435,7 @@ export function App() {
               ["1 – 9", "Travel to an artist, left to right"],
               ["⌫", "Go back one step"],
               ["M", "Mute or unmute previews"],
+              ["D", "Drift: travel on by itself"],
               ["/  ⌘K", "Search for an artist"],
               ["?", "Show or hide shortcuts"]
             ].map(([keys, action]) => (
