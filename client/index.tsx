@@ -517,7 +517,9 @@ function useAnimatedCamera(target: Camera, onRest?: () => void) {
 }
 
 const APP_NAME = "Drift";
-const DEFAULT_TINT = "hsl(232 62% 74%)";
+// Pale champagne starlight used whenever a photo has no usable color (black-and-white shots, artists
+// without a photo, or before an image loads). Warm and quiet enough to read as "no color of its own".
+const DEFAULT_TINT = "hsl(42 48% 74%)";
 // A star, its orbit, and a warm moon: the solar-system rings in miniature. Lakebed serves no static
 // files, so the icons are attached to the document head at startup.
 const FAVICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><defs><radialGradient id="s" cx="50%" cy="50%" r="50%"><stop offset="0" stop-color="#fff"/><stop offset=".45" stop-color="#e6e2ff"/><stop offset="1" stop-color="#8a7dff" stop-opacity="0"/></radialGradient></defs><rect width="64" height="64" rx="14" fill="#07061a"/><circle cx="32" cy="32" r="21" fill="none" stroke="#8a7dff" stroke-opacity=".75" stroke-width="2.4"/><circle cx="32" cy="32" r="13" fill="url(#s)"/><circle cx="46.8" cy="17.2" r="5.2" fill="#ffb08a"/></svg>`;
@@ -546,8 +548,6 @@ const DEEZER_MARK = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAA
 const tintCache = new Map<string, string | null>();
 const tintListeners = new Set<() => void>();
 
-// A neutral silver glow for artists without a photo, like the grey placeholders streaming apps use.
-const VINYL_TINT = "hsl(240 6% 70%)";
 
 // Artists without a photo get a plain grey vinyl record. The label turns; the sheen stays put like a reflection.
 function VinylRecord() {
@@ -1004,6 +1004,8 @@ export function App() {
   const rootLoadRequestIdRef = useRef(0);
   const artistSearchInputRef = useRef<HTMLInputElement>(null);
   const artistPickerRef = useRef<HTMLFormElement>(null);
+  const keyboardHandlerRef = useRef<(event: KeyboardEvent) => void>(() => undefined);
+  const [showShortcuts, setShowShortcuts] = useState(false);
   const focusedNode = tree[focusId] ?? rootNode;
   const cameraFocusedNode = tree[cameraFocusId] ?? focusedNode;
   const isTraveling = focusId !== cameraFocusId;
@@ -1020,7 +1022,7 @@ export function App() {
   const renderedNodes = loadedNodes;
   const tintFor = useTints(renderedNodes.map((node) => node.imageUrl).filter((url): url is string => Boolean(url)));
   const route = useMemo(() => routeTo(tree, cameraFocusedNode), [tree, cameraFocusedNode]);
-  const aura = cameraFocusedNode.imageUrl ? tintFor(cameraFocusedNode.imageUrl) : VINYL_TINT;
+  const aura = cameraFocusedNode.imageUrl ? tintFor(cameraFocusedNode.imageUrl) : DEFAULT_TINT;
   const cameraDriftX = (CENTER - camera.x) / camera.scale - CENTER;
   const cameraDriftY = (CENTER - camera.y) / camera.scale - CENTER;
   const engineRef = useRef<PreviewEngine>();
@@ -1042,6 +1044,22 @@ export function App() {
   useEffect(() => {
     installIcons();
   }, []);
+
+  useEffect(() => {
+    if (!showShortcuts) {
+      return;
+    }
+
+    function closeShortcuts() {
+      setShowShortcuts(false);
+    }
+
+    document.addEventListener("pointerdown", closeShortcuts);
+
+    return () => {
+      document.removeEventListener("pointerdown", closeShortcuts);
+    };
+  }, [showShortcuts]);
 
   // Close the search results when a click lands anywhere outside the search box.
   useEffect(() => {
@@ -1218,12 +1236,7 @@ export function App() {
 
   useEffect(() => {
     function handleGlobalKeyDown(event: KeyboardEvent) {
-      if (!(event.metaKey || event.ctrlKey) || event.key.toLowerCase() !== "k") {
-        return;
-      }
-
-      event.preventDefault();
-      focusArtistSearchInput({ selectText: true });
+      keyboardHandlerRef.current(event);
     }
 
     window.addEventListener("keydown", handleGlobalKeyDown);
@@ -1533,6 +1546,132 @@ export function App() {
     setTree((currentTree) => attachChildren(updateNodeArtist(currentTree, rootNode.id, result.data), rootNode.id, result.data.related));
   }
 
+  function planetButton(nodeId: string) {
+    return document.querySelector<HTMLButtonElement>(`[data-node-id="${CSS.escape(nodeId)}"]`);
+  }
+
+  // Spatial navigation: from the highlighted planet (or the focused artist), move to the nearest
+  // orbiting artist in the arrow's direction, wrapping to the far side when nothing is left that way.
+  function moveSelection(direction: { x: number; y: number }) {
+    const children = getChildren(tree, focusedNode);
+    const activeId = (document.activeElement as HTMLElement | null)?.dataset?.nodeId;
+    const current = children.find((child) => child.id === activeId);
+    const origin = current ?? focusedNode;
+    const candidates = children.filter((child) => child.id !== current?.id);
+    const along = (node: TreeNode) => (node.x - origin.x) * direction.x + (node.y - origin.y) * direction.y;
+    let best: TreeNode | undefined;
+    let bestScore = Infinity;
+
+    for (const candidate of candidates) {
+      const forward = along(candidate);
+      if (forward <= 0) {
+        continue;
+      }
+
+      const sideways = Math.abs((candidate.x - origin.x) * direction.y - (candidate.y - origin.y) * direction.x);
+      const score = forward + sideways * 2;
+      if (score < bestScore) {
+        bestScore = score;
+        best = candidate;
+      }
+    }
+
+    best ??= candidates.reduce<TreeNode | undefined>((farthest, candidate) => (!farthest || along(candidate) < along(farthest) ? candidate : farthest), undefined);
+    if (best) {
+      planetButton(best.id)?.focus();
+    }
+  }
+
+  function handleSearchKeys(event: KeyboardEvent) {
+    const picker = artistPickerRef.current;
+    if (!picker) {
+      return;
+    }
+
+    if (event.key === "Escape" && event.target !== artistSearchInputRef.current) {
+      setIsArtistPickerOpen(false);
+      (document.activeElement as HTMLElement | null)?.blur();
+      return;
+    }
+
+    if (event.key !== "ArrowDown" && event.key !== "ArrowUp") {
+      return;
+    }
+
+    const items = [artistSearchInputRef.current, ...Array.from(picker.querySelectorAll<HTMLButtonElement>(".artist-search-result:not(:disabled)"))].filter(
+      (item): item is HTMLInputElement | HTMLButtonElement => Boolean(item)
+    );
+    const index = items.indexOf(document.activeElement as HTMLInputElement | HTMLButtonElement);
+    if (index === -1 || items.length < 2) {
+      return;
+    }
+
+    event.preventDefault();
+    items[event.key === "ArrowDown" ? Math.min(items.length - 1, index + 1) : Math.max(0, index - 1)]?.focus();
+  }
+
+  keyboardHandlerRef.current = (event: KeyboardEvent) => {
+    if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
+      event.preventDefault();
+      focusArtistSearchInput({ selectText: true });
+      return;
+    }
+
+    if (event.metaKey || event.ctrlKey || event.altKey) {
+      return;
+    }
+
+    const target = event.target as HTMLElement | null;
+    if (target && artistPickerRef.current?.contains(target)) {
+      handleSearchKeys(event);
+      return;
+    }
+
+    if (target?.isContentEditable || target?.tagName === "INPUT" || target?.tagName === "TEXTAREA") {
+      return;
+    }
+
+    const arrows: Record<string, { x: number; y: number }> = {
+      ArrowLeft: { x: -1, y: 0 },
+      ArrowRight: { x: 1, y: 0 },
+      ArrowUp: { x: 0, y: -1 },
+      ArrowDown: { x: 0, y: 1 }
+    };
+    const arrow = arrows[event.key];
+
+    if (arrow) {
+      event.preventDefault();
+      if (!isTraveling) {
+        moveSelection(arrow);
+      }
+    } else if (/^[1-9]$/.test(event.key)) {
+      const ordered = [...getChildren(tree, focusedNode)].sort((first, second) => first.x - second.x);
+      const destination = ordered[Number(event.key) - 1];
+      if (destination) {
+        event.preventDefault();
+        focusNode(destination.id);
+      }
+    } else if (event.key === "Backspace") {
+      if (focusedNode.parentId) {
+        event.preventDefault();
+        focusNode(focusedNode.parentId);
+      }
+    } else if (event.key === "m" || event.key === "M") {
+      handleSoundClick();
+    } else if (event.key === "/") {
+      event.preventDefault();
+      focusArtistSearchInput();
+    } else if (event.key === "?") {
+      setShowShortcuts((current) => !current);
+    } else if (event.key === "Escape") {
+      if (showShortcuts) {
+        setShowShortcuts(false);
+      } else {
+        (document.activeElement as HTMLElement | null)?.blur();
+      }
+    }
+  };
+
   function renderArtistNode(node: TreeNode, role: NodeRole, radius: number, cameraScale: number, options: { interactive: boolean }) {
     const isFocus = role === "focus";
     const isReachable = isInteractiveRole(role);
@@ -1542,7 +1681,7 @@ export function App() {
     const worldDiameter = (radius / cameraScale) * 2;
     const style = {
       ...nodeStyle(node, radius, cameraScale),
-      "--planet": node.imageUrl ? tintFor(node.imageUrl) : VINYL_TINT,
+      "--planet": node.imageUrl ? tintFor(node.imageUrl) : DEFAULT_TINT,
       "--emerge-x": parent ? `${(((parent.x - node.x) / worldDiameter) * 100).toFixed(1)}%` : "0%",
       "--emerge-y": parent ? `${(((parent.y - node.y) / worldDiameter) * 100).toFixed(1)}%` : "0%"
     };
@@ -1567,6 +1706,7 @@ export function App() {
             <button
               aria-label={isRetry ? `Retry loading artists related to ${node.label}` : isFocus ? `${node.label}, you are here` : `Travel to ${node.label}`}
               className="planet"
+              data-node-id={node.id}
               disabled={!options.interactive}
               onBlur={canHover ? () => setHoveredId((current) => (current === node.id ? undefined : current)) : undefined}
               onClick={options.interactive ? () => focusNode(node.id) : undefined}
@@ -1612,13 +1752,13 @@ export function App() {
         @property --aura {
           syntax: "<color>";
           inherits: true;
-          initial-value: hsl(232 62% 74%);
+          initial-value: hsl(42 48% 74%);
         }
 
         @property --aura-2 {
           syntax: "<color>";
           inherits: true;
-          initial-value: hsl(278 62% 74%);
+          initial-value: hsl(42 48% 74%);
         }
 
         :root {
@@ -2086,8 +2226,74 @@ export function App() {
           text-align: left;
         }
 
-        .node-child:hover .node-name {
+        .node-child:hover .node-name,
+        .node-child:has(.planet:focus-visible) .node-name {
           color: #fff;
+        }
+
+        .node-button:has(.planet:focus-visible) {
+          transform: translate(-50%, -50%) scale(1.07);
+        }
+
+        .hud-key {
+          display: inline-block;
+          min-width: 1.4em;
+          padding: 2px 6px;
+          border: 1px solid rgba(238, 234, 248, 0.16);
+          border-radius: 6px;
+          background: rgba(238, 234, 248, 0.05);
+          color: var(--ink);
+          font: 500 10.5px/1.3 var(--font-mono);
+          text-align: center;
+          white-space: pre;
+        }
+
+        .shortcuts {
+          width: min(440px, calc(100vw - 32px));
+          position: fixed;
+          bottom: calc(max(24px, env(safe-area-inset-bottom)) + 62px);
+          left: 50%;
+          z-index: 7;
+          box-sizing: border-box;
+          padding: 16px 18px 12px;
+          border: 1px solid rgba(238, 234, 248, 0.1);
+          border-radius: 22px;
+          background: rgba(9, 9, 24, 0.86);
+          box-shadow: 0 24px 60px rgba(0, 0, 0, 0.5);
+          transform: translateX(-50%);
+          backdrop-filter: blur(20px) saturate(1.2);
+          animation: panel-rise 220ms var(--ease-graph) both;
+        }
+
+        .shortcuts-eyebrow {
+          margin: 0 0 10px;
+          color: var(--dust);
+          font: 500 10px/1 var(--font-mono);
+          letter-spacing: 0.18em;
+          text-transform: uppercase;
+        }
+
+        .shortcuts-list {
+          display: grid;
+          gap: 8px;
+          margin: 0;
+        }
+
+        .shortcuts-row {
+          display: grid;
+          grid-template-columns: 96px 1fr;
+          align-items: center;
+          gap: 12px;
+        }
+
+        .shortcuts-row dt,
+        .shortcuts-row dd {
+          margin: 0;
+        }
+
+        .shortcuts-row dd {
+          color: rgba(238, 234, 248, 0.78);
+          font-size: 13px;
         }
 
         .node-parent .node-name {
@@ -2785,7 +2991,9 @@ export function App() {
         {isDeadEnd ? (
           <p className="hud-empty">Deezer has no related artists for {cameraFocusedNode.label}. Go back a step or search for someone else.</p>
         ) : jumps === 0 ? (
-          <p className="hud-hint">Pick an orbiting artist to travel to them.</p>
+          <p className="hud-hint">
+            Pick an orbiting artist to travel to them. Press <kbd className="hud-key">?</kbd> for shortcuts.
+          </p>
         ) : null}
       </nav>
 
@@ -2830,6 +3038,30 @@ export function App() {
         <img alt="" className="hud-credit-mark" src={DEEZER_MARK} />
         Deezer
       </p>
+
+      {showShortcuts ? (
+        <div aria-label="Keyboard shortcuts" className="shortcuts" role="dialog">
+          <p className="shortcuts-eyebrow">Keyboard</p>
+          <dl className="shortcuts-list">
+            {[
+              ["← → ↑ ↓", "Move between orbiting artists"],
+              ["Enter", "Travel to the highlighted artist"],
+              ["1 – 9", "Travel to an artist, left to right"],
+              ["⌫", "Go back one step"],
+              ["M", "Mute or unmute previews"],
+              ["/  ⌘K", "Search for an artist"],
+              ["?", "Show or hide shortcuts"]
+            ].map(([keys, action]) => (
+              <div className="shortcuts-row" key={keys}>
+                <dt>
+                  <kbd className="hud-key">{keys}</kbd>
+                </dt>
+                <dd>{action}</dd>
+              </div>
+            ))}
+          </dl>
+        </div>
+      ) : null}
 
       <form
         className="artist-picker"
