@@ -1078,6 +1078,33 @@ function SoundIcon({ muted }: { muted: boolean }) {
   );
 }
 
+// The artists someone started from, most recent first, shown when they open an empty search.
+const RECENT_STARTS_KEY = "drift:recent-starts:v1";
+const RECENT_STARTS_LIMIT = 6;
+
+function readRecentStarts(): ArtistSummary[] {
+  try {
+    const stored = JSON.parse(window.localStorage.getItem(RECENT_STARTS_KEY) ?? "[]") as unknown;
+    return Array.isArray(stored)
+      ? stored.filter((artist): artist is ArtistSummary => typeof artist?.id === "string" && typeof artist?.name === "string").slice(0, RECENT_STARTS_LIMIT)
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+function writeRecentStarts(artists: ArtistSummary[]) {
+  try {
+    if (artists.length === 0) {
+      window.localStorage.removeItem(RECENT_STARTS_KEY);
+    } else {
+      window.localStorage.setItem(RECENT_STARTS_KEY, JSON.stringify(artists));
+    }
+  } catch {
+    // Storage can be full or blocked; the list still works for this session.
+  }
+}
+
 function routeTo(tree: TreeState, node: TreeNode) {
   const route: TreeNode[] = [];
   let current: TreeNode | undefined = node;
@@ -1103,6 +1130,7 @@ export function App() {
   const [coreArtistId, setCoreArtistId] = useState(kendrickLamarFallback.id);
   const [artistSearchText, setArtistSearchText] = useState("");
   const [artistSearchResults, setArtistSearchResults] = useState<ArtistSummary[]>([]);
+  const [recentStarts, setRecentStarts] = useState<ArtistSummary[]>(() => (typeof window === "undefined" ? [] : readRecentStarts()));
   const [artistSearchStatus, setArtistSearchStatus] = useState<SearchStatus>("idle");
   const [artistSearchError, setArtistSearchError] = useState<string | undefined>();
   const [isArtistPickerOpen, setIsArtistPickerOpen] = useState(false);
@@ -1119,6 +1147,8 @@ export function App() {
   const artistPickerRef = useRef<HTMLFormElement>(null);
   const keyboardHandlerRef = useRef<(event: KeyboardEvent) => void>(() => undefined);
   const [showShortcuts, setShowShortcuts] = useState(false);
+  // Opening search from the keyboard (⌘K, /) happens constantly, so the panel appears without animating.
+  const [searchOpenedByKeyboard, setSearchOpenedByKeyboard] = useState(false);
   const focusedNode = tree[focusId] ?? rootNode;
   const cameraFocusedNode = tree[cameraFocusId] ?? focusedNode;
   const isTraveling = focusId !== cameraFocusId;
@@ -1130,8 +1160,10 @@ export function App() {
   const camera = useAnimatedCamera(targetCamera, () => setFocusId(cameraFocusId));
   const loadedNodes = useMemo(() => Object.values(tree).sort((a, b) => a.depth - b.depth || a.id.localeCompare(b.id)), [tree]);
   const trimmedArtistSearchText = artistSearchText.trim();
+  const showRecentStarts = isArtistPickerOpen && trimmedArtistSearchText.length < 2 && recentStarts.length > 0;
   const showArtistSearchPanel =
-    isArtistPickerOpen && (trimmedArtistSearchText.length >= 2 || artistSearchResults.length > 0 || artistSearchStatus !== "idle" || Boolean(artistSearchError));
+    showRecentStarts ||
+    (isArtistPickerOpen && (trimmedArtistSearchText.length >= 2 || artistSearchResults.length > 0 || artistSearchStatus !== "idle" || Boolean(artistSearchError)));
   const renderedNodes = loadedNodes;
   const tintFor = useTints(renderedNodes.map((node) => node.imageUrl).filter((url): url is string => Boolean(url)));
   const route = useMemo(() => routeTo(tree, cameraFocusedNode), [tree, cameraFocusedNode]);
@@ -1785,9 +1817,50 @@ export function App() {
     setCameraFocusId(nodeId);
   }
 
+  function removeRecentStart(artistId: string) {
+    const index = recentStarts.findIndex((artist) => artist.id === artistId);
+    const next = recentStarts.filter((artist) => artist.id !== artistId);
+    setRecentStarts(next);
+    writeRecentStarts(next);
+
+    // Keep keyboard focus in the row: move to the neighbor that slides into place, or back to the input.
+    requestAnimationFrame(() => {
+      const buttons = artistPickerRef.current?.querySelectorAll<HTMLButtonElement>(".recent-start-button");
+      (buttons?.[Math.min(index, (buttons?.length ?? 1) - 1)] ?? artistSearchInputRef.current)?.focus();
+    });
+  }
+
+  function clearRecentStarts() {
+    setRecentStarts([]);
+    writeRecentStarts([]);
+    artistSearchInputRef.current?.focus();
+  }
+
+  function renderSearchOption(artist: ArtistSummary) {
+    return (
+      <button
+        aria-selected={artist.id === coreArtistId}
+        className="artist-search-result"
+        disabled={rootLoadId === artist.id}
+        key={artist.id}
+        onClick={() => void chooseCoreArtist(artist)}
+        role="option"
+        type="button"
+      >
+        <span className="artist-search-result-media">
+          {artist.imageUrl ? <img alt="" className="artist-search-result-image" crossOrigin="anonymous" draggable={false} src={artist.imageUrl} /> : <VinylRecord />}
+        </span>
+        <span className="artist-search-result-copy">
+          <span className="artist-search-result-name">{artist.name}</span>
+          {artist.id === coreArtistId ? <span className="artist-search-result-meta">Current start</span> : null}
+        </span>
+      </button>
+    );
+  }
+
   function handleArtistSearchSubmit(event: SubmitEvent) {
     event.preventDefault();
-    const firstArtist = artistSearchResults[0];
+    const firstArtist = artistSearchResults[0] ?? (showRecentStarts ? recentStarts[0] : undefined);
 
     if (firstArtist) {
       void chooseCoreArtist(firstArtist);
@@ -1826,7 +1899,16 @@ export function App() {
 
     const loadingCore = makeRootNode(artist, "loading");
     setCoreArtistId(artist.id);
-    setArtistSearchText(artist.name);
+    // Clear the box so reopening search shows recent starts instead of re-running this search.
+    setArtistSearchText("");
+    setRecentStarts((current) => {
+      const next = [{ id: artist.id, name: artist.name, imageUrl: artist.imageUrl, url: artist.url }, ...current.filter((recent) => recent.id !== artist.id)].slice(
+        0,
+        RECENT_STARTS_LIMIT
+      );
+      writeRecentStarts(next);
+      return next;
+    });
     setArtistSearchResults([]);
     setArtistSearchStatus("idle");
     setArtistSearchError(undefined);
@@ -1921,25 +2003,39 @@ export function App() {
       return;
     }
 
-    if (event.key !== "ArrowDown" && event.key !== "ArrowUp") {
+    const onRecentStart = (document.activeElement as HTMLElement | null)?.classList.contains("recent-start-button");
+    const recentId = (document.activeElement as HTMLElement | null)?.dataset?.recentId;
+    if (onRecentStart && recentId && (event.key === "Delete" || event.key === "Backspace")) {
+      event.preventDefault();
+      removeRecentStart(recentId);
       return;
     }
 
-    const items = [artistSearchInputRef.current, ...Array.from(picker.querySelectorAll<HTMLButtonElement>(".artist-search-result:not(:disabled)"))].filter(
-      (item): item is HTMLInputElement | HTMLButtonElement => Boolean(item)
-    );
+    // Up/down always move through the panel; left/right too, but only across the recent-starts row so
+    // they still move the caret while typing.
+    const forward = event.key === "ArrowDown" || (onRecentStart && event.key === "ArrowRight");
+    const backward = event.key === "ArrowUp" || (onRecentStart && event.key === "ArrowLeft");
+    if (!forward && !backward) {
+      return;
+    }
+
+    const items = [
+      artistSearchInputRef.current,
+      ...Array.from(picker.querySelectorAll<HTMLButtonElement>(".recent-start-button:not(:disabled), .artist-search-result:not(:disabled)"))
+    ].filter((item): item is HTMLInputElement | HTMLButtonElement => Boolean(item));
     const index = items.indexOf(document.activeElement as HTMLInputElement | HTMLButtonElement);
     if (index === -1 || items.length < 2) {
       return;
     }
 
     event.preventDefault();
-    items[event.key === "ArrowDown" ? Math.min(items.length - 1, index + 1) : Math.max(0, index - 1)]?.focus();
+    items[forward ? Math.min(items.length - 1, index + 1) : Math.max(0, index - 1)]?.focus();
   }
 
   keyboardHandlerRef.current = (event: KeyboardEvent) => {
     if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
       event.preventDefault();
+      setSearchOpenedByKeyboard(true);
       focusArtistSearchInput({ selectText: true });
       return;
     }
@@ -1990,6 +2086,7 @@ export function App() {
       toggleDrift();
     } else if (event.key === "/") {
       event.preventDefault();
+      setSearchOpenedByKeyboard(true);
       focusArtistSearchInput();
     } else if (event.key === "?") {
       setShowShortcuts((current) => !current);
@@ -2592,7 +2689,6 @@ export function App() {
           box-shadow: 0 24px 60px rgba(0, 0, 0, 0.5);
           transform: translateX(-50%);
           backdrop-filter: blur(20px) saturate(1.2);
-          animation: panel-rise 220ms var(--ease-graph) both;
         }
 
         .shortcuts-title {
@@ -3010,7 +3106,8 @@ export function App() {
           background: rgba(9, 9, 24, 0.84);
           box-shadow: 0 24px 60px rgba(0, 0, 0, 0.5);
           backdrop-filter: blur(20px) saturate(1.2);
-          animation: panel-rise 220ms var(--ease-graph) both;
+          transform-origin: bottom center;
+          animation: panel-rise 160ms var(--ease-graph) both;
         }
 
         .artist-search-message {
@@ -3023,6 +3120,165 @@ export function App() {
 
         .artist-search-message-error {
           color: #ffd2bf;
+        }
+
+        .artist-search-panel-instant {
+          animation: none;
+        }
+
+        .recent-starts {
+          display: grid;
+          grid-template-columns: repeat(6, minmax(0, 1fr));
+          gap: 2px;
+          padding: 0 2px 4px;
+        }
+
+        .recent-start {
+          position: relative;
+          min-width: 0;
+        }
+
+        .recent-start-button {
+          width: 100%;
+          display: grid;
+          justify-items: center;
+          gap: 8px;
+          padding: 10px 4px 9px;
+          border: 0;
+          border-radius: 16px;
+          background: transparent;
+          color: var(--ink);
+          cursor: pointer;
+          transition:
+            background 150ms ease,
+            transform 160ms var(--ease-graph);
+        }
+
+        .recent-start-button:active {
+          transform: scale(0.97);
+        }
+
+        .recent-start-button:focus-visible {
+          outline: none;
+          background: rgba(238, 234, 248, 0.08);
+        }
+
+        .recent-start-button:disabled {
+          cursor: default;
+          opacity: 0.6;
+        }
+
+        .recent-start-planet {
+          width: 46px;
+          height: 46px;
+          position: relative;
+          overflow: hidden;
+          border-radius: 50%;
+          background: radial-gradient(circle at 34% 30%, #2b2944, #0b0a17 72%);
+          box-shadow:
+            0 0 0 1px rgba(238, 234, 248, 0.12),
+            0 8px 18px rgba(0, 0, 0, 0.45);
+          transition: box-shadow 200ms ease;
+        }
+
+        .recent-start-button[aria-current] .recent-start-planet {
+          box-shadow:
+            0 0 0 1.5px var(--aura),
+            0 0 16px -2px var(--aura),
+            0 8px 18px rgba(0, 0, 0, 0.45);
+        }
+
+        .recent-start-name {
+          max-width: 100%;
+          min-height: 2.4em;
+          display: -webkit-box;
+          overflow: hidden;
+          color: rgba(238, 234, 248, 0.78);
+          font: 500 11.5px/1.2 var(--font-ui);
+          text-align: center;
+          text-wrap: balance;
+          overflow-wrap: anywhere;
+          -webkit-box-orient: vertical;
+          -webkit-line-clamp: 2;
+          transition: color 150ms ease;
+        }
+
+        .recent-start-button[aria-current] .recent-start-name,
+        .recent-start-button:focus-visible .recent-start-name {
+          color: var(--ink);
+        }
+
+        .recent-start-remove {
+          width: 18px;
+          height: 18px;
+          position: absolute;
+          top: 6px;
+          right: calc(50% - 30px);
+          display: grid;
+          place-items: center;
+          padding: 0;
+          border: 0;
+          border-radius: 50%;
+          background: rgba(22, 21, 42, 0.96);
+          box-shadow: 0 0 0 1px rgba(238, 234, 248, 0.2);
+          color: var(--dust);
+          cursor: pointer;
+          opacity: 0;
+          pointer-events: none;
+          transition:
+            opacity 150ms ease,
+            color 150ms ease;
+        }
+
+        @media (hover: hover) and (pointer: fine) {
+          .recent-start-button:hover {
+            background: rgba(238, 234, 248, 0.06);
+          }
+
+          .recent-start-button:hover .recent-start-name {
+            color: var(--ink);
+          }
+
+          .recent-start:hover .recent-start-remove {
+            opacity: 1;
+            pointer-events: auto;
+          }
+
+          .recent-start-remove:hover {
+            color: var(--ink);
+          }
+        }
+
+        .artist-search-heading {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          padding: 8px 8px 6px 12px;
+          color: var(--dust);
+          font: 500 12px/1 var(--font-ui);
+        }
+
+        .artist-search-clear {
+          padding: 5px 8px;
+          border: 0;
+          border-radius: 8px;
+          background: transparent;
+          color: var(--dust);
+          cursor: pointer;
+          font: inherit;
+          transition:
+            color 150ms ease,
+            background 150ms ease;
+        }
+
+        .artist-search-clear:hover {
+          background: rgba(238, 234, 248, 0.07);
+          color: var(--ink);
+        }
+
+        .artist-search-clear:focus-visible {
+          outline: 1.5px solid var(--aura);
+          outline-offset: 1px;
         }
 
         .artist-search-result {
@@ -3042,10 +3298,15 @@ export function App() {
             transform 140ms var(--ease-graph);
         }
 
-        .artist-search-result:hover,
         .artist-search-result:focus-visible {
           outline: none;
           background: rgba(238, 234, 248, 0.07);
+        }
+
+        @media (hover: hover) and (pointer: fine) {
+          .artist-search-result:hover {
+            background: rgba(238, 234, 248, 0.07);
+          }
         }
 
         .artist-search-result[aria-selected="true"] {
@@ -3195,7 +3456,7 @@ export function App() {
         @keyframes panel-rise {
           from {
             opacity: 0;
-            transform: translateY(6px);
+            transform: translateY(4px) scale(0.98);
           }
         }
 
@@ -3230,6 +3491,25 @@ export function App() {
 
           .sound-copy {
             display: none;
+          }
+
+          .recent-start-planet {
+            width: 40px;
+            height: 40px;
+          }
+
+          .recent-starts {
+            gap: 0;
+            padding: 0 0 4px;
+          }
+
+          .recent-start-button {
+            padding: 10px 1px 9px;
+          }
+
+          .recent-start-name {
+            font-size: 10.5px;
+            letter-spacing: -0.01em;
           }
 
           .hud-route {
@@ -3453,7 +3733,7 @@ export function App() {
         <label className="sr-only" htmlFor="core-artist-search">
           Start from another artist
         </label>
-        <div className="artist-search-control" onClick={() => focusArtistSearchInput()}>
+        <div className="artist-search-control" onClick={() => focusArtistSearchInput()} onPointerDown={() => setSearchOpenedByKeyboard(false)}>
           <span aria-hidden="true" className="artist-search-icon" />
           <input
             aria-autocomplete="list"
@@ -3479,31 +3759,62 @@ export function App() {
         </div>
 
         {showArtistSearchPanel ? (
-          <div className="artist-search-panel" id="core-artist-search-results" role="listbox">
+          <div
+            className={`artist-search-panel${searchOpenedByKeyboard ? " artist-search-panel-instant" : ""}`}
+            id="core-artist-search-results"
+            role={showRecentStarts ? undefined : "listbox"}
+          >
             {artistSearchStatus === "searching" ? <div className="artist-search-message">Searching Deezer…</div> : null}
             {artistSearchStatus === "error" ? <div className="artist-search-message artist-search-message-error">{artistSearchError}</div> : null}
             {artistSearchStatus === "idle" && trimmedArtistSearchText.length >= 2 && artistSearchResults.length === 0 ? (
               <div className="artist-search-message">No artists match “{trimmedArtistSearchText}”. Try a different spelling.</div>
             ) : null}
-            {artistSearchResults.map((artist) => (
-              <button
-                aria-selected={artist.id === coreArtistId}
-                className="artist-search-result"
-                disabled={rootLoadId === artist.id}
-                key={artist.id}
-                onClick={() => void chooseCoreArtist(artist)}
-                role="option"
-                type="button"
-              >
-                <span className="artist-search-result-media">
-                  {artist.imageUrl ? <img alt="" className="artist-search-result-image" crossOrigin="anonymous" draggable={false} src={artist.imageUrl} /> : <VinylRecord />}
-                </span>
-                <span className="artist-search-result-copy">
-                  <span className="artist-search-result-name">{artist.name}</span>
-                  {artist.id === coreArtistId ? <span className="artist-search-result-meta">Current start</span> : null}
-                </span>
-              </button>
-            ))}
+            {showRecentStarts ? (
+              <>
+                <div className="artist-search-heading" role="presentation">
+                  <span>Recent starts</span>
+                  <button className="artist-search-clear" onClick={clearRecentStarts} type="button">
+                    Clear
+                  </button>
+                </div>
+                <div aria-label="Recent starts" className="recent-starts" role="group">
+                  {recentStarts.map((artist) => {
+                    const isCurrent = artist.id === coreArtistId;
+                    return (
+                      <div className="recent-start" key={artist.id}>
+                        <button
+                          aria-current={isCurrent ? "true" : undefined}
+                          aria-label={isCurrent ? `${artist.name}, current start` : `Start from ${artist.name}`}
+                          className="recent-start-button"
+                          data-recent-id={artist.id}
+                          disabled={rootLoadId === artist.id}
+                          onClick={() => void chooseCoreArtist(artist)}
+                          title={artist.name}
+                          type="button"
+                        >
+                          <span className="recent-start-planet">
+                            {artist.imageUrl ? <img alt="" className="artist-search-result-image" crossOrigin="anonymous" draggable={false} src={artist.imageUrl} /> : <VinylRecord />}
+                          </span>
+                          <span className="recent-start-name">{artist.name}</span>
+                        </button>
+                        <button
+                          aria-label={`Remove ${artist.name} from recent starts`}
+                          className="recent-start-remove"
+                          onClick={() => removeRecentStart(artist.id)}
+                          tabIndex={-1}
+                          type="button"
+                        >
+                          <svg aria-hidden="true" fill="none" height="8" viewBox="0 0 8 8" width="8">
+                            <path d="M1.5 1.5l5 5M6.5 1.5l-5 5" stroke="currentColor" stroke-linecap="round" stroke-width="1.4" />
+                          </svg>
+                        </button>
+                      </div>
+                    );
+                  })}
+                </div>
+              </>
+            ) : null}
+            {artistSearchResults.map(renderSearchOption)}
           </div>
         ) : null}
       </form>
