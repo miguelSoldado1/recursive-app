@@ -2,12 +2,15 @@ import { boolean, capsule, endpoint, mutation, query, string, table, text } from
 import {
   ARTIST_SEARCH_LIMIT,
   KENDRICK_LAMAR_ID,
+  PREVIEW_TRACK_LIMIT,
   RELATED_ARTIST_LIMIT,
   ROOT_RELATED_ARTIST_LIMIT,
   type ArtistNeighborhood,
   type ArtistNeighborhoodResult,
+  type ArtistPreviewsResult,
   type ArtistSearchResult,
-  type ArtistSummary
+  type ArtistSummary,
+  type TrackPreview
 } from "../shared/artist";
 
 // All artist data comes from Deezer's public API, which needs no credentials.
@@ -20,6 +23,10 @@ type DeezerArtistObject = {
 };
 type DeezerTrackObject = {
   contributors?: DeezerArtistObject[];
+  id?: number;
+  preview?: string;
+  readable?: boolean;
+  title_short?: string;
 };
 type DeezerList<T> = {
   data?: T[];
@@ -39,7 +46,9 @@ const DEEZER_API = "https://api.deezer.com";
 const DEEZER_CACHE_TTL_MS = 10 * 60 * 1000;
 const DEEZER_QUOTA_ERROR_CODE = 4;
 const DEEZER_NOT_FOUND_ERROR_CODE = 800;
-const COLLABORATOR_TRACK_LIMIT = 50;
+const TOP_TRACK_LIMIT = 50;
+// Keep cached preview URLs well inside their signed lifetime so clients get time to play them.
+const PREVIEW_URL_SAFETY_MS = 5 * 60 * 1000;
 const ROOT_RELATED_ARTIST_CANDIDATE_LIMIT = ROOT_RELATED_ARTIST_LIMIT * 3;
 const RELATED_ARTIST_CANDIDATE_LIMIT = RELATED_ARTIST_LIMIT * 5;
 
@@ -77,7 +86,7 @@ async function fetchDeezerJson<T>(path: string): Promise<T> {
   return body;
 }
 
-async function requestDeezer<T>(path: string): Promise<T> {
+async function requestDeezer<T>(path: string, ttlFor: (value: T) => number = () => DEEZER_CACHE_TTL_MS): Promise<T> {
   const cached = deezerCache.get(path);
   if (cached && cached.expiresAt > Date.now()) {
     return cached.value as T;
@@ -89,10 +98,14 @@ async function requestDeezer<T>(path: string): Promise<T> {
   }
 
   const request = fetchDeezerJson<T>(path).then((value) => {
-    deezerCache.set(path, {
-      expiresAt: Date.now() + DEEZER_CACHE_TTL_MS,
-      value
-    });
+    const ttl = ttlFor(value);
+    if (ttl > 0) {
+      deezerCache.set(path, {
+        expiresAt: Date.now() + ttl,
+        value
+      });
+    }
+
     return value;
   });
 
@@ -153,9 +166,43 @@ async function getSimilarArtists(artistId: string, limit: number) {
   return normalizeDeezerArtists(response.data, artistId);
 }
 
+function previewExpiresAt(url: string) {
+  const match = /exp=(\d+)/.exec(url);
+  return match ? Number(match[1]) * 1000 : undefined;
+}
+
+// Top tracks feed both the collaborator fallback and the audio previews, so they share one request.
+// The cache lifetime follows the earliest preview URL expiry instead of the usual ten minutes.
+async function getTopTracks(artistId: string) {
+  return requestDeezer<DeezerList<DeezerTrackObject>>(`/artist/${encodeURIComponent(artistId)}/top?limit=${TOP_TRACK_LIMIT}`, (response) => {
+    const expiries = (response.data ?? []).map((track) => (track.preview ? previewExpiresAt(track.preview) : undefined)).filter((expiry): expiry is number => Boolean(expiry));
+    const earliest = expiries.length > 0 ? Math.min(...expiries) : undefined;
+
+    return earliest ? Math.min(DEEZER_CACHE_TTL_MS, earliest - Date.now() - PREVIEW_URL_SAFETY_MS) : DEEZER_CACHE_TTL_MS;
+  });
+}
+
+async function getPreviews(artistId: string): Promise<TrackPreview[]> {
+  const response = await getTopTracks(artistId);
+  const previews: TrackPreview[] = [];
+
+  for (const track of response.data ?? []) {
+    if (!track.id || !track.preview || !track.title_short || track.readable === false) {
+      continue;
+    }
+
+    previews.push({ id: String(track.id), title: track.title_short, url: track.preview });
+    if (previews.length >= PREVIEW_TRACK_LIMIT) {
+      break;
+    }
+  }
+
+  return previews;
+}
+
 // People featured on the artist's most popular tracks, ranked by how often they show up.
 async function getCollaboratorArtists(artistId: string, limit: number) {
-  const response = await requestDeezer<DeezerList<DeezerTrackObject>>(`/artist/${encodeURIComponent(artistId)}/top?limit=${COLLABORATOR_TRACK_LIMIT}`);
+  const response = await getTopTracks(artistId);
   const scores = new Map<string, { artist: DeezerArtistObject; score: number }>();
 
   for (const track of response.data ?? []) {
@@ -192,11 +239,13 @@ async function getRelatedArtists(artistId: string, limit: number) {
 }
 
 async function getArtistNeighborhood(artistId: string, limit: number): Promise<ArtistNeighborhood> {
-  const [artist, related] = await Promise.all([getArtist(artistId), getRelatedArtists(artistId, limit)]);
+  // A missing preview shouldn't cost the whole neighborhood, so preview failures fall back to silence.
+  const [artist, related, previews] = await Promise.all([getArtist(artistId), getRelatedArtists(artistId, limit), getPreviews(artistId).catch(() => [])]);
 
   return {
     artist,
-    related
+    related,
+    previews
   };
 }
 
@@ -237,6 +286,20 @@ async function getArtistNeighborhoodResult(artistId: string, limit: number): Pro
   }
 }
 
+async function getArtistPreviewsResult(artistId: string): Promise<ArtistPreviewsResult> {
+  try {
+    return {
+      ok: true,
+      data: await getPreviews(artistId)
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      error: error instanceof Error ? error.message : "Unable to load previews from Deezer."
+    };
+  }
+}
+
 async function getArtistSearchResult(term: string): Promise<ArtistSearchResult> {
   try {
     return {
@@ -269,7 +332,8 @@ export default capsule({
   mutations: {
     searchArtists: mutation((_ctx, term: string) => getArtistSearchResult(term)),
     loadRootArtist: mutation((_ctx, artistId: string) => getArtistNeighborhoodResult(artistId, ROOT_RELATED_ARTIST_CANDIDATE_LIMIT)),
-    loadRelatedArtists: mutation((_ctx, artistId: string) => getArtistNeighborhoodResult(artistId, RELATED_ARTIST_CANDIDATE_LIMIT))
+    loadRelatedArtists: mutation((_ctx, artistId: string) => getArtistNeighborhoodResult(artistId, RELATED_ARTIST_CANDIDATE_LIMIT)),
+    loadArtistPreviews: mutation((_ctx, artistId: string) => getArtistPreviewsResult(artistId))
   },
 
   endpoints: {

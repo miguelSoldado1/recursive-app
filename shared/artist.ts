@@ -11,15 +11,36 @@ export type ArtistSummary = {
   fans?: number;
 };
 
+export const PREVIEW_TRACK_LIMIT = 3;
+
+// A 30-second clip of one of the artist's top tracks. Deezer signs these URLs and they expire
+// after roughly half an hour, so clients should refresh them before playing a stale one.
+export type TrackPreview = {
+  id: string;
+  title: string;
+  url: string;
+};
+
 export type ArtistNeighborhood = {
   artist: ArtistSummary;
   related: ArtistSummary[];
+  previews: TrackPreview[];
 };
 
 export type ArtistNeighborhoodResult =
   | {
       ok: true;
       data: ArtistNeighborhood;
+    }
+  | {
+      ok: false;
+      error: string;
+    };
+
+export type ArtistPreviewsResult =
+  | {
+      ok: true;
+      data: TrackPreview[];
     }
   | {
       ok: false;

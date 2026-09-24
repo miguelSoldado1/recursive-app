@@ -4,9 +4,12 @@ import {
   RELATED_ARTIST_LIMIT,
   ROOT_RELATED_ARTIST_LIMIT,
   kendrickLamarFallback,
+  type ArtistNeighborhood,
   type ArtistNeighborhoodResult,
+  type ArtistPreviewsResult,
   type ArtistSearchResult,
-  type ArtistSummary
+  type ArtistSummary,
+  type TrackPreview
 } from "../shared/artist";
 
 type ChildrenStatus = "idle" | "loading" | "loaded" | "error";
@@ -17,6 +20,7 @@ type TreeNode = {
   label: string;
   imageUrl?: string;
   url?: string;
+  previews?: TrackPreview[];
   depth: number;
   angle: number;
   childIndex: number;
@@ -192,7 +196,7 @@ function getChildren(tree: TreeState, node: TreeNode) {
     .sort((a, b) => a.childIndex - b.childIndex);
 }
 
-function updateNodeArtist(tree: TreeState, nodeId: string, artist: ArtistSummary) {
+function updateNodeArtist(tree: TreeState, nodeId: string, neighborhood: Pick<ArtistNeighborhood, "artist" | "previews">) {
   const node = tree[nodeId];
   if (!node) {
     return tree;
@@ -202,7 +206,8 @@ function updateNodeArtist(tree: TreeState, nodeId: string, artist: ArtistSummary
     ...tree,
     [nodeId]: {
       ...node,
-      ...artistFields(artist)
+      ...artistFields(neighborhood.artist),
+      previews: neighborhood.previews
     }
   };
 }
@@ -793,6 +798,180 @@ function formatFans(fans?: number) {
   return `${compact.replace(".0", "")} ${fans === 1 ? "fan" : "fans"}`;
 }
 
+const PREVIEW_VOLUME = 0.7;
+const PREVIEW_FADE_IN_SECONDS = 1.4;
+const PREVIEW_FADE_OUT_SECONDS = 0.9;
+const PREVIEW_REFRESH_MARGIN_MS = 60 * 1000;
+const SOUND_PREFERENCE_KEY = "recursive-app:sound";
+
+type Deck = { audio: HTMLAudioElement; gain: GainNode };
+type AudioLevels = { energy: number; bands: [number, number, number] };
+
+function readSoundPreference() {
+  try {
+    return window.localStorage.getItem(SOUND_PREFERENCE_KEY) !== "off";
+  } catch {
+    return true;
+  }
+}
+
+function writeSoundPreference(soundOn: boolean) {
+  try {
+    window.localStorage.setItem(SOUND_PREFERENCE_KEY, soundOn ? "on" : "off");
+  } catch {
+    // Private browsing can block storage; the toggle still works for this session.
+  }
+}
+
+function previewExpiresSoon(url: string) {
+  const match = /exp=(\d+)/.exec(url);
+  return match ? Number(match[1]) * 1000 - Date.now() < PREVIEW_REFRESH_MARGIN_MS : false;
+}
+
+function setNodePreviews(tree: TreeState, nodeId: string, previews: TrackPreview[]) {
+  const node = tree[nodeId];
+  return node ? { ...tree, [nodeId]: { ...node, previews } } : tree;
+}
+
+// Two decks so one artist's preview can fade out while the next fades in. Audio runs through Web Audio:
+// gain ramps work on iOS (which ignores element.volume), and the analyser drives the focused planet's
+// pulse. Deezer serves previews with CORS headers, which Web Audio needs in order to hear them.
+class PreviewEngine {
+  private context?: AudioContext;
+  private analyser?: AnalyserNode;
+  private decks: Deck[] = [];
+  private activeDeck = 0;
+  private playToken = 0;
+  private frequencies = new Uint8Array(0);
+
+  // Browsers only allow audio after a user gesture, so this must run inside one.
+  unlock() {
+    if (!this.context) {
+      const AudioContextClass = window.AudioContext ?? (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+      if (!AudioContextClass) {
+        return false;
+      }
+
+      const context = new AudioContextClass();
+      const analyser = context.createAnalyser();
+      analyser.fftSize = 64;
+      analyser.smoothingTimeConstant = 0.8;
+      analyser.connect(context.destination);
+      this.decks = [0, 1].map(() => {
+        const audio = new Audio();
+        audio.crossOrigin = "anonymous";
+        audio.preload = "auto";
+        const gain = context.createGain();
+        gain.gain.value = 0;
+        context.createMediaElementSource(audio).connect(gain);
+        gain.connect(analyser);
+        return { audio, gain };
+      });
+      this.context = context;
+      this.analyser = analyser;
+      this.frequencies = new Uint8Array(analyser.frequencyBinCount);
+    }
+
+    void this.context.resume();
+    return true;
+  }
+
+  async play(url: string, onEnded: () => void) {
+    if (!this.context) {
+      return false;
+    }
+
+    const token = ++this.playToken;
+    this.fadeOut(this.decks[this.activeDeck]);
+    this.activeDeck = 1 - this.activeDeck;
+    const incoming = this.decks[this.activeDeck];
+    this.ramp(incoming.gain, 0, 0);
+    incoming.audio.onended = () => {
+      if (token === this.playToken) {
+        onEnded();
+      }
+    };
+    incoming.audio.src = url;
+
+    try {
+      await incoming.audio.play();
+    } catch {
+      return false;
+    }
+
+    if (token !== this.playToken) {
+      return false;
+    }
+
+    this.ramp(incoming.gain, PREVIEW_VOLUME, PREVIEW_FADE_IN_SECONDS);
+    return true;
+  }
+
+  stop() {
+    this.playToken += 1;
+    this.decks.forEach((deck) => this.fadeOut(deck));
+  }
+
+  readLevels(): AudioLevels {
+    if (!this.analyser) {
+      return { energy: 0, bands: [0, 0, 0] };
+    }
+
+    this.analyser.getByteFrequencyData(this.frequencies);
+    const average = (from: number, to: number) => {
+      let total = 0;
+      for (let index = from; index < to; index += 1) {
+        total += this.frequencies[index] ?? 0;
+      }
+      return total / ((to - from) * 255);
+    };
+    const bands: [number, number, number] = [average(1, 4), average(4, 11), average(11, 24)];
+
+    return { energy: bands[0] * 0.6 + bands[1] * 0.3 + bands[2] * 0.1, bands };
+  }
+
+  private fadeOut(deck: Deck | undefined) {
+    if (!deck) {
+      return;
+    }
+
+    this.ramp(deck.gain, 0, PREVIEW_FADE_OUT_SECONDS);
+    const fadingSource = deck.audio.src;
+    window.setTimeout(() => {
+      // Only pause if this deck wasn't picked up again for a new track during the fade.
+      if (deck.audio.src === fadingSource && deck.gain.gain.value < 0.01) {
+        deck.audio.pause();
+      }
+    }, PREVIEW_FADE_OUT_SECONDS * 1000 + 60);
+  }
+
+  private ramp(gain: GainNode, target: number, seconds: number) {
+    if (!this.context) {
+      return;
+    }
+
+    const now = this.context.currentTime;
+    gain.gain.cancelScheduledValues(now);
+    gain.gain.setValueAtTime(seconds === 0 ? target : gain.gain.value, now);
+    if (seconds > 0) {
+      gain.gain.linearRampToValueAtTime(target, now + seconds);
+    }
+  }
+}
+
+function SoundIcon({ muted }: { muted: boolean }) {
+  return (
+    <svg aria-hidden="true" fill="none" height="16" viewBox="0 0 16 16" width="16">
+      <path d="M2.5 6h2.2L8 3.2v9.6L4.7 10H2.5z" fill="currentColor" />
+      {muted ? (
+        <path d="M11 6l3.5 4M14.5 6L11 10" stroke="currentColor" stroke-linecap="round" stroke-width="1.4" />
+      ) : (
+        <path d="M10.6 5.6a3.4 3.4 0 010 4.8M12.4 3.9a5.8 5.8 0 010 8.2" stroke="currentColor" stroke-linecap="round" stroke-width="1.4" />
+      )}
+    </svg>
+  );
+}
+
 function routeTo(tree: TreeState, node: TreeNode) {
   const route: TreeNode[] = [];
   let current: TreeNode | undefined = node;
@@ -810,6 +989,7 @@ export function App() {
   const searchArtists = useMutation<[term: string], ArtistSearchResult>("searchArtists");
   const loadRootArtist = useMutation<[artistId: string], ArtistNeighborhoodResult>("loadRootArtist");
   const loadRelatedArtists = useMutation<[artistId: string], ArtistNeighborhoodResult>("loadRelatedArtists");
+  const loadArtistPreviews = useMutation<[artistId: string], ArtistPreviewsResult>("loadArtistPreviews");
   const [tree, setTree] = useState<TreeState>(() => createInitialTree());
   const [focusId, setFocusId] = useState(rootNode.id);
   const [cameraFocusId, setCameraFocusId] = useState(rootNode.id);
@@ -849,6 +1029,166 @@ export function App() {
   const aura = cameraFocusedNode.imageUrl ? tintFor(cameraFocusedNode.imageUrl) : proceduralTint(cameraFocusedNode.artistId);
   const cameraDriftX = (CENTER - camera.x) / camera.scale - CENTER;
   const cameraDriftY = (CENTER - camera.y) / camera.scale - CENTER;
+  const engineRef = useRef<PreviewEngine>();
+  const cosmosRef = useRef<HTMLElement>(null);
+  const refreshedPreviewsRef = useRef(new Set<string>());
+  const [soundOn, setSoundOn] = useState(readSoundPreference);
+  const [audioUnlocked, setAudioUnlocked] = useState(false);
+  const [nowPlaying, setNowPlaying] = useState<string | undefined>();
+  const [previewRefreshCount, setPreviewRefreshCount] = useState(0);
+  const playingNode = cameraFocusedNode;
+  const playingPreviews = playingNode.previews;
+  // Keyed by URL so an identical list arriving again (e.g. a re-sent query) doesn't restart the track.
+  const playingPreviewsKey = playingPreviews ? playingPreviews.map((preview) => preview.url).join("|") : undefined;
+
+  if (!engineRef.current) {
+    engineRef.current = new PreviewEngine();
+  }
+
+  // The first click or key press anywhere unlocks audio; until then browsers keep the page silent.
+  useEffect(() => {
+    function unlockAudio() {
+      if (engineRef.current?.unlock()) {
+        setAudioUnlocked(true);
+        window.removeEventListener("pointerdown", unlockAudio);
+        window.removeEventListener("keydown", unlockAudio);
+      }
+    }
+
+    window.addEventListener("pointerdown", unlockAudio);
+    window.addEventListener("keydown", unlockAudio);
+
+    return () => {
+      window.removeEventListener("pointerdown", unlockAudio);
+      window.removeEventListener("keydown", unlockAudio);
+    };
+  }, []);
+
+  // Music follows the camera: as you fly to an artist, the old preview fades out and theirs fades in.
+  useEffect(() => {
+    const engine = engineRef.current;
+    if (!engine || !soundOn || !audioUnlocked || !playingPreviews || playingPreviews.length === 0) {
+      engine?.stop();
+      setNowPlaying(undefined);
+      return;
+    }
+
+    const refreshKey = `${playingNode.id}:${playingPreviews[0]?.url}`;
+    if (playingPreviews.some((preview) => previewExpiresSoon(preview.url)) && !refreshedPreviewsRef.current.has(refreshKey)) {
+      refreshedPreviewsRef.current.add(refreshKey);
+      engine.stop();
+      setNowPlaying(undefined);
+      const nodeId = playingNode.id;
+      void loadArtistPreviews(playingNode.artistId)
+        .then((result) => {
+          if (result.ok) {
+            setTree((currentTree) => setNodePreviews(currentTree, nodeId, result.data));
+          }
+        })
+        .catch(() => undefined)
+        // Retry playback either way: the refresh can come back with the same, still-valid URLs.
+        .finally(() => setPreviewRefreshCount((count) => count + 1));
+      return;
+    }
+
+    let cancelled = false;
+
+    function playTrack(index: number, failures: number) {
+      const tracks = playingPreviews ?? [];
+      const track = tracks[index % tracks.length];
+      if (!track || cancelled) {
+        return;
+      }
+
+      setNowPlaying(track.title);
+      void engine!
+        .play(track.url, () => {
+          if (!cancelled) {
+            playTrack(index + 1, 0);
+          }
+        })
+        .then((started) => {
+          if (!started && !cancelled) {
+            // Skip a clip that won't load; give up quietly once every clip has failed.
+            if (failures + 1 < tracks.length) {
+              playTrack(index + 1, failures + 1);
+            } else {
+              setNowPlaying(undefined);
+            }
+          }
+        });
+    }
+
+    playTrack(0, 0);
+
+    return () => {
+      cancelled = true;
+    };
+  }, [playingNode.id, playingPreviewsKey, soundOn, audioUnlocked, previewRefreshCount]);
+
+  // The focused planet's corona breathes with the music's low end.
+  useEffect(() => {
+    const element = cosmosRef.current;
+    if (!element || !nowPlaying || prefersReducedMotion()) {
+      element?.style.setProperty("--beat", "0");
+      return;
+    }
+
+    let frame = 0;
+    let energyAverage: number | undefined;
+    let pulse = 0;
+    const bandAverages: (number | undefined)[] = [undefined, undefined, undefined];
+    const clamp = (value: number) => Math.min(1, Math.max(0, value));
+
+    // Loud masters sit at a nearly constant level, so react to how far each frame rises above the
+    // recent average: a quick kick on each beat that decays, instead of a glow stuck at one size.
+    function tick() {
+      const levels = engineRef.current?.readLevels();
+      if (levels && element) {
+        energyAverage = energyAverage === undefined ? levels.energy : energyAverage * 0.96 + levels.energy * 0.04;
+        pulse = Math.max(clamp((levels.energy - energyAverage) * 6), pulse * 0.88);
+        element.style.setProperty("--beat", pulse.toFixed(3));
+        levels.bands.forEach((band, index) => {
+          const average = bandAverages[index];
+          const nextAverage = average === undefined ? band : average * 0.94 + band * 0.06;
+          bandAverages[index] = nextAverage;
+          element.style.setProperty(`--band-${index}`, clamp(0.35 + (band - nextAverage) * 5).toFixed(3));
+        });
+      }
+
+      frame = requestAnimationFrame(tick);
+    }
+
+    frame = requestAnimationFrame(tick);
+
+    return () => {
+      cancelAnimationFrame(frame);
+      element.style.setProperty("--beat", "0");
+      [0, 1, 2].forEach((index) => element.style.setProperty(`--band-${index}`, "0"));
+    };
+  }, [nowPlaying]);
+
+  function handleSoundPointerDown(event: PointerEvent) {
+    // Handle unlocking here so the window listener doesn't also treat this press as a toggle.
+    event.stopPropagation();
+  }
+
+  function handleSoundClick() {
+    if (!audioUnlocked) {
+      if (engineRef.current?.unlock()) {
+        setAudioUnlocked(true);
+      }
+
+      setSoundOn(true);
+      writeSoundPreference(true);
+      return;
+    }
+
+    setSoundOn((current) => {
+      writeSoundPreference(!current);
+      return !current;
+    });
+  }
 
   useEffect(() => {
     treeRef.current = tree;
@@ -935,7 +1275,7 @@ export function App() {
     }
 
     setLoadError(undefined);
-    setTree((currentTree) => attachChildren(updateNodeArtist(currentTree, rootNode.id, artistRoot.data.artist), rootNode.id, artistRoot.data.related));
+    setTree((currentTree) => attachChildren(updateNodeArtist(currentTree, rootNode.id, artistRoot.data), rootNode.id, artistRoot.data.related));
   }, [artistRoot, coreArtistId]);
 
   useEffect(() => {
@@ -1059,7 +1399,7 @@ export function App() {
         setLoadError(undefined);
       }
 
-      setTree((currentTree) => attachChildren(updateNodeArtist(currentTree, nodeId, result.data.artist), nodeId, result.data.related));
+      setTree((currentTree) => attachChildren(updateNodeArtist(currentTree, nodeId, result.data), nodeId, result.data.related));
       return true;
     })();
 
@@ -1168,7 +1508,7 @@ export function App() {
 
     setLoadError(undefined);
     setCoreArtistId(result.data.artist.id);
-    setTree((currentTree) => attachChildren(updateNodeArtist(currentTree, rootNode.id, result.data.artist), rootNode.id, result.data.related));
+    setTree((currentTree) => attachChildren(updateNodeArtist(currentTree, rootNode.id, result.data), rootNode.id, result.data.related));
   }
 
   function renderArtistNode(node: TreeNode, role: NodeRole, radius: number, cameraScale: number, options: { interactive: boolean }) {
@@ -1240,7 +1580,7 @@ export function App() {
   const visibleRoute = route.length > 5 ? [route[0], undefined, ...route.slice(-3)] : route;
 
   return (
-    <main className="cosmos" style={{ "--aura": aura, "--aura-2": shiftHue(aura, 46) } as Record<string, string>}>
+    <main className="cosmos" ref={cosmosRef} style={{ "--aura": aura, "--aura-2": shiftHue(aura, 46) } as Record<string, string>}>
       <style>{`
         @import url("https://api.fontshare.com/v2/css?f[]=clash-display@500,600&f[]=satoshi@500,700&display=swap");
         @import url("https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&display=swap");
@@ -1509,6 +1849,7 @@ export function App() {
             transparent 100%
           );
           animation: corona-breathe 8s ease-in-out infinite;
+          scale: calc(1 + var(--beat, 0) * 0.3);
         }
 
         .planet {
@@ -1795,6 +2136,97 @@ export function App() {
           color: color-mix(in oklab, var(--ember) 70%, white);
           font-size: 12.5px;
           line-height: 1.4;
+        }
+
+        .sound-control {
+          max-width: min(280px, calc(50vw - 250px));
+          position: fixed;
+          left: 24px;
+          bottom: max(24px, env(safe-area-inset-bottom));
+          z-index: 4;
+          display: flex;
+          align-items: center;
+          gap: 11px;
+        }
+
+        .sound-button {
+          width: 38px;
+          height: 38px;
+          flex: 0 0 auto;
+          display: grid;
+          place-items: center;
+          padding: 0;
+          border: 1px solid rgba(238, 234, 248, 0.14);
+          border-radius: 50%;
+          background: rgba(10, 10, 26, 0.55);
+          color: var(--ink);
+          cursor: pointer;
+          backdrop-filter: blur(14px);
+          transition:
+            border-color 200ms ease,
+            background 200ms ease,
+            transform 140ms var(--ease-graph);
+        }
+
+        .sound-button:hover {
+          border-color: color-mix(in oklab, var(--aura) 50%, transparent);
+          background: rgba(16, 16, 36, 0.72);
+        }
+
+        .sound-button:active {
+          transform: scale(0.94);
+        }
+
+        .sound-button:focus-visible {
+          outline: 1.5px solid var(--aura);
+          outline-offset: 3px;
+        }
+
+        .sound-bars {
+          height: 14px;
+          display: flex;
+          align-items: flex-end;
+          gap: 2.5px;
+        }
+
+        .sound-bars span {
+          width: 3px;
+          border-radius: 2px;
+          background: var(--aura);
+          box-shadow: 0 0 8px color-mix(in oklab, var(--aura) 60%, transparent);
+        }
+
+        .sound-bars span:nth-child(1) {
+          height: calc(3px + var(--band-0, 0) * 11px);
+        }
+
+        .sound-bars span:nth-child(2) {
+          height: calc(3px + var(--band-1, 0) * 14px);
+        }
+
+        .sound-bars span:nth-child(3) {
+          height: calc(3px + var(--band-2, 0) * 18px);
+        }
+
+        .sound-copy {
+          min-width: 0;
+          display: grid;
+          gap: 4px;
+        }
+
+        .sound-eyebrow {
+          color: var(--dust);
+          font: 500 9.5px/1 var(--font-mono);
+          letter-spacing: 0.18em;
+          text-transform: uppercase;
+        }
+
+        .sound-title {
+          overflow: hidden;
+          color: rgba(238, 234, 248, 0.82);
+          font: 500 12.5px/1.2 var(--font-ui);
+          text-overflow: ellipsis;
+          white-space: nowrap;
         }
 
         .hud-credit {
@@ -2171,8 +2603,20 @@ export function App() {
             width: min(100vw, 78vh);
           }
 
+          .sound-control {
+            max-width: none;
+            top: max(14px, env(safe-area-inset-top));
+            right: 14px;
+            bottom: auto;
+            left: auto;
+          }
+
+          .sound-copy {
+            display: none;
+          }
+
           .hud-route {
-            max-width: calc(100vw - 32px);
+            max-width: calc(100vw - 80px);
             top: max(16px, env(safe-area-inset-top));
             left: 16px;
           }
@@ -2293,6 +2737,43 @@ export function App() {
           <p className="hud-hint">Pick an orbiting artist to travel to them.</p>
         ) : null}
       </nav>
+
+      <div className={`sound-control${nowPlaying ? " sound-control-playing" : ""}`}>
+        <button
+          aria-label={soundOn && audioUnlocked ? "Mute previews" : "Play previews"}
+          aria-pressed={soundOn && audioUnlocked}
+          className="sound-button"
+          onClick={handleSoundClick}
+          onPointerDown={handleSoundPointerDown}
+          type="button"
+        >
+          {nowPlaying ? (
+            <span aria-hidden="true" className="sound-bars">
+              <span />
+              <span />
+              <span />
+            </span>
+          ) : (
+            <SoundIcon muted={!soundOn} />
+          )}
+        </button>
+        <span aria-live="polite" className="sound-copy">
+          {!soundOn ? (
+            <span className="sound-title">Previews muted</span>
+          ) : !audioUnlocked ? (
+            <span className="sound-title">Play previews</span>
+          ) : nowPlaying ? (
+            <>
+              <span className="sound-eyebrow">Now playing</span>
+              <span className="sound-title">{nowPlaying}</span>
+            </>
+          ) : playingPreviews && playingPreviews.length === 0 ? (
+            <span className="sound-title">No preview for {playingNode.label}</span>
+          ) : (
+            <span className="sound-title">Tuning in…</span>
+          )}
+        </span>
+      </div>
 
       <p className="hud-credit">
         <img alt="" className="hud-credit-mark" src={DEEZER_MARK} />
