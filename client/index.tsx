@@ -1,117 +1,2369 @@
-import { Link, Route, Router, Routes, SignInWithGoogle, signOut, useAuth, useMutation, useQuery } from "lakebed/client";
-import { useState } from "preact/hooks";
-import { cleanTodoText, type Todo } from "../shared/todo";
+import { useMutation, useQuery } from "lakebed/client";
+import { useEffect, useMemo, useRef, useState } from "preact/hooks";
+import {
+  RELATED_ARTIST_LIMIT,
+  ROOT_RELATED_ARTIST_LIMIT,
+  kendrickLamarFallback,
+  type ArtistNeighborhoodResult,
+  type ArtistSearchResult,
+  type ArtistSummary
+} from "../shared/artist";
 
-function AuthAvatar({ label, picture }: { label: string; picture?: string }) {
-  const initial = label.trim().slice(0, 1).toUpperCase() || "?";
+type ChildrenStatus = "idle" | "loading" | "loaded" | "error";
+type SearchStatus = "idle" | "searching" | "error";
+type TreeNode = {
+  id: string;
+  artistId: string;
+  label: string;
+  imageUrl?: string;
+  url?: string;
+  depth: number;
+  angle: number;
+  childIndex: number;
+  x: number;
+  y: number;
+  childrenStatus: ChildrenStatus;
+  error?: string;
+  parentId?: string;
+};
 
-  if (picture) {
-    return (
-      <img
-        alt=""
-        className="h-7 w-7 shrink-0 rounded-full border border-neutral-800 bg-neutral-900 object-cover"
-        referrerPolicy="no-referrer"
-        src={picture}
-      />
-    );
-  }
+type TreeState = Record<string, TreeNode>;
+type NodeRole = "focus" | "parent" | "child" | "ancestor" | "ghost";
+type EdgeRole = "parent" | "route" | "child";
+type OrbitRing = {
+  id: string;
+  x: number;
+  y: number;
+  radius: number;
+  role: "inner" | "current" | "next" | "horizon";
+};
 
-  return (
-    <span
-      aria-hidden="true"
-      className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full border border-neutral-800 bg-neutral-900 text-xs font-medium text-neutral-300"
-    >
-      {initial}
-    </span>
-  );
+type Camera = {
+  scale: number;
+  x: number;
+  y: number;
+};
+
+const SIZE = 1000;
+const CENTER = SIZE / 2;
+const ROOT_CHILDREN = ROOT_RELATED_ARTIST_LIMIT;
+const CHILDREN_PER_NODE = RELATED_ARTIST_LIMIT;
+const RING_STEP = 330;
+const CHILD_SPACING = 280;
+const MAX_CHILD_STEP_DEGREES = 40;
+const BASE_CAMERA_SCALE = 1.16;
+const CAMERA_SCALE_PER_DEPTH = 0.08;
+const MAX_CAMERA_SCALE = 1.42;
+const CAMERA_FIT_RADIUS = 395;
+const MIN_CAMERA_SCALE = 0.96;
+const CAMERA_BALANCE = 0.3;
+const PREVIEW_STUB_LENGTH = 0.42;
+const FOCUS_RADIUS = 68;
+const PARENT_RADIUS = 43;
+const CHILD_RADIUS = 48;
+const GHOST_RADIUS = 24;
+const LOAD_THROTTLE_MS = 120;
+
+const rootNode: TreeNode = {
+  id: "core",
+  artistId: kendrickLamarFallback.id,
+  label: kendrickLamarFallback.name,
+  imageUrl: kendrickLamarFallback.imageUrl,
+  url: kendrickLamarFallback.url,
+  depth: 0,
+  angle: -90,
+  childIndex: 0,
+  childrenStatus: "idle",
+  x: CENTER,
+  y: CENTER
+};
+
+function toRadians(degrees: number) {
+  return (degrees * Math.PI) / 180;
 }
 
-function TodoPage() {
-  const todos = useQuery<Todo[]>("todos");
-  const addTodo = useMutation<[text: string], void>("addTodo");
+function pointFrom(origin: { x: number; y: number }, distance: number, angle: number) {
+  const radians = toRadians(angle);
 
-  async function onSubmit(event: SubmitEvent) {
-    event.preventDefault();
-    const form = event.currentTarget as HTMLFormElement;
-    const data = new FormData(form);
-    const text = cleanTodoText(String(data.get("text") ?? ""));
-    if (!text) {
+  return {
+    x: origin.x + Math.cos(radians) * distance,
+    y: origin.y + Math.sin(radians) * distance
+  };
+}
+
+function cameraFor(tree: TreeState, node: TreeNode): Camera {
+  const desiredScale = Math.min(MAX_CAMERA_SCALE, BASE_CAMERA_SCALE + node.depth * CAMERA_SCALE_PER_DEPTH);
+  const parent = node.parentId ? tree[node.parentId] : undefined;
+  const loadedChildren = getChildren(tree, node);
+  const childPoints =
+    loadedChildren.length > 0
+      ? loadedChildren
+      : planChildAngles(node).map((angle) => childPoint(node, angle));
+  const localPoints = [parent, ...childPoints].filter((point): point is { x: number; y: number } => Boolean(point));
+  // Children always sit further out than the parent, so aim between the focus and the middle of its
+  // neighborhood; otherwise the view is empty on the inward side and crowded on the outward side.
+  const centroid = localPoints.reduce((sum, point) => ({ x: sum.x + point.x / localPoints.length, y: sum.y + point.y / localPoints.length }), { x: 0, y: 0 });
+  const anchor =
+    localPoints.length > 0
+      ? { x: node.x + (centroid.x - node.x) * CAMERA_BALANCE, y: node.y + (centroid.y - node.y) * CAMERA_BALANCE }
+      : { x: node.x, y: node.y };
+  const farthestLocalPoint = [node, ...localPoints].reduce((distance, point) => Math.max(distance, Math.hypot(point.x - anchor.x, point.y - anchor.y)), 0);
+  const fitScale = farthestLocalPoint > 0 ? CAMERA_FIT_RADIUS / farthestLocalPoint : desiredScale;
+  const scale = Math.max(MIN_CAMERA_SCALE, Math.min(desiredScale, fitScale));
+
+  return {
+    scale,
+    x: CENTER - anchor.x * scale,
+    y: CENTER - anchor.y * scale
+  };
+}
+
+function easeInOutCubic(value: number) {
+  return value < 0.5 ? 4 * value * value * value : 1 - Math.pow(-2 * value + 2, 3) / 2;
+}
+
+function getChildCount(node: TreeNode) {
+  return node.id === rootNode.id ? ROOT_CHILDREN : CHILDREN_PER_NODE;
+}
+
+function ringRadius(depth: number) {
+  return depth * RING_STEP;
+}
+
+// Like a solar system: every artist sits on the orbit that matches how many jumps it is from where you
+// started. Children land on the next ring out, centered on their parent's bearing from the origin.
+function planChildAngles(parent: TreeNode) {
+  const count = getChildCount(parent);
+
+  if (parent.id === rootNode.id) {
+    return Array.from({ length: count }, (_, childIndex) => -90 + childIndex * (360 / count));
+  }
+
+  const step = Math.min(MAX_CHILD_STEP_DEGREES, (CHILD_SPACING / ringRadius(parent.depth + 1)) * (180 / Math.PI));
+  return Array.from({ length: count }, (_, childIndex) => parent.angle + (childIndex - (count - 1) / 2) * step);
+}
+
+function childPoint(parent: TreeNode, angle: number) {
+  return pointFrom({ x: CENTER, y: CENTER }, ringRadius(parent.depth + 1), angle);
+}
+
+function makeNodeId(parent: TreeNode, childIndex: number, artist: ArtistSummary) {
+  return `${parent.id}-${childIndex + 1}-${artist.id}`;
+}
+
+function artistFields(artist: ArtistSummary) {
+  return {
+    artistId: artist.id,
+    label: artist.name,
+    imageUrl: artist.imageUrl,
+    url: artist.url
+  };
+}
+
+function makeRootNode(artist: ArtistSummary, childrenStatus: ChildrenStatus = "idle"): TreeNode {
+  return {
+    ...rootNode,
+    ...artistFields(artist),
+    childrenStatus,
+    error: undefined
+  };
+}
+
+function makeChild(parent: TreeNode, childIndex: number, artist: ArtistSummary, angle: number): TreeNode {
+  const id = makeNodeId(parent, childIndex, artist);
+  const point = childPoint(parent, angle);
+
+  return {
+    id,
+    ...artistFields(artist),
+    depth: parent.depth + 1,
+    angle,
+    childIndex,
+    parentId: parent.id,
+    childrenStatus: "idle",
+    x: point.x,
+    y: point.y
+  };
+}
+
+function getChildren(tree: TreeState, node: TreeNode) {
+  return Object.values(tree)
+    .filter((candidate) => candidate.parentId === node.id)
+    .sort((a, b) => a.childIndex - b.childIndex);
+}
+
+function updateNodeArtist(tree: TreeState, nodeId: string, artist: ArtistSummary) {
+  const node = tree[nodeId];
+  if (!node) {
+    return tree;
+  }
+
+  return {
+    ...tree,
+    [nodeId]: {
+      ...node,
+      ...artistFields(artist)
+    }
+  };
+}
+
+function setNodeChildrenStatus(tree: TreeState, nodeId: string, childrenStatus: ChildrenStatus, error?: string) {
+  const node = tree[nodeId];
+  if (!node) {
+    return tree;
+  }
+
+  return {
+    ...tree,
+    [nodeId]: {
+      ...node,
+      childrenStatus,
+      error
+    }
+  };
+}
+
+function attachChildren(tree: TreeState, parentId: string, artists: ArtistSummary[]) {
+  const parent = tree[parentId];
+  if (!parent) {
+    return tree;
+  }
+
+  const nextTree = setNodeChildrenStatus(tree, parentId, "loaded");
+  const existingChildren = getChildren(tree, parent);
+  const existingChildByArtistId = new Map(existingChildren.map((child) => [child.artistId, child]));
+  // Only artists on the route here are off-limits (that would loop back). Artists hidden in other
+  // branches aren't visible, so they can show up again wherever they're a good match.
+  const usedArtistIds = new Set(routeTo(tree, parent).map((node) => node.artistId));
+  const acceptedArtistIds = new Set<string>();
+  const nextChildren: ArtistSummary[] = [];
+
+  for (const artist of artists) {
+    const isExistingChild = existingChildByArtistId.has(artist.id);
+
+    if (acceptedArtistIds.has(artist.id) || (usedArtistIds.has(artist.id) && !isExistingChild)) {
+      continue;
+    }
+
+    acceptedArtistIds.add(artist.id);
+    nextChildren.push(artist);
+
+    if (nextChildren.length >= getChildCount(parent)) {
+      break;
+    }
+  }
+
+  const angles = planChildAngles(parent);
+
+  for (let childIndex = 0; childIndex < nextChildren.length; childIndex += 1) {
+    const artist = nextChildren[childIndex];
+    const existingChild = existingChildByArtistId.get(artist.id);
+    const child = existingChild ?? makeChild(parent, childIndex, artist, angles[childIndex]);
+
+    nextTree[child.id] = existingChild
+      ? {
+          ...existingChild,
+          ...artistFields(artist)
+        }
+      : child;
+  }
+
+  return nextTree;
+}
+
+function createInitialTree() {
+  const core = makeRootNode(kendrickLamarFallback);
+  return { [core.id]: core };
+}
+
+// Only your route and the focused artist's orbit are visible; everything else stays in the fog.
+function buildNodeRoles(tree: TreeState, focusedNode: TreeNode) {
+  const roles = new Map<string, NodeRole>();
+  roles.set(focusedNode.id, "focus");
+  let ancestor = focusedNode.parentId ? tree[focusedNode.parentId] : undefined;
+
+  if (ancestor) {
+    roles.set(ancestor.id, "parent");
+    ancestor = ancestor.parentId ? tree[ancestor.parentId] : undefined;
+  }
+
+  while (ancestor) {
+    roles.set(ancestor.id, "ancestor");
+    ancestor = ancestor.parentId ? tree[ancestor.parentId] : undefined;
+  }
+
+  for (const child of getChildren(tree, focusedNode)) {
+    roles.set(child.id, "child");
+  }
+
+  return roles;
+}
+
+function buildEdges(tree: TreeState, roles: Map<string, NodeRole>) {
+  return Object.values(tree).flatMap((node) => {
+    const parent = node.parentId ? tree[node.parentId] : undefined;
+    const parentRole = parent ? roles.get(parent.id) : undefined;
+    const nodeRole = roles.get(node.id);
+    let role: EdgeRole | undefined;
+
+    if (parentRole === "parent" && nodeRole === "focus") {
+      role = "parent";
+    } else if (parentRole === "focus" && nodeRole === "child") {
+      role = "child";
+    } else if (parentRole === "ancestor" && (nodeRole === "parent" || nodeRole === "ancestor")) {
+      role = "route";
+    }
+
+    return parent && role ? [{ id: `${parent.id}-${node.id}`, parent, child: node, role }] : [];
+  });
+}
+
+function buildProjectedPreviewEdges(tree: TreeState, focusedNode: TreeNode) {
+  return getChildren(tree, focusedNode).flatMap((child) => {
+    const projectedPoints =
+      child.childrenStatus === "loaded" ? getChildren(tree, child) : planChildAngles(child).map((angle) => childPoint(child, angle));
+
+    return projectedPoints.map((projectedPoint, childIndex) => {
+      return {
+        id: `${child.id}-projected-preview-${childIndex}`,
+        parentId: child.id,
+        x1: child.x,
+        y1: child.y,
+        // Just a short hint toward the next orbit; the full line would be a spoiler and visual noise.
+        x2: child.x + (projectedPoint.x - child.x) * PREVIEW_STUB_LENGTH,
+        y2: child.y + (projectedPoint.y - child.y) * PREVIEW_STUB_LENGTH
+      };
+    });
+  });
+}
+
+// One ring per distance from the origin: the ring the focused artist orbits on, the ring its neighbors
+// sit on, and a faint horizon beyond that where the next jump would land.
+function buildOrbitRings(tree: TreeState, focusedNode: TreeNode): OrbitRing[] {
+  const hasChildren = getChildren(tree, focusedNode).length > 0;
+  const outermost = focusedNode.depth + (hasChildren ? 2 : 0);
+  // Far from the origin the rings are nearly straight, so extra ones read as graph paper; keep just
+  // the ring you're on and the one your next choices sit on.
+  const innermost = focusedNode.depth > 2 ? focusedNode.depth : 1;
+  const lastRing = focusedNode.depth > 2 ? Math.min(outermost, focusedNode.depth + 1) : outermost;
+
+  return Array.from({ length: Math.max(0, lastRing - innermost + 1) }, (_, index) => innermost + index).map((depth) => ({
+    id: `ring-${depth}`,
+    x: CENTER,
+    y: CENTER,
+    radius: ringRadius(depth),
+    role: depth === focusedNode.depth + 2 ? "horizon" : depth === focusedNode.depth + 1 ? "next" : depth === focusedNode.depth ? "current" : "inner"
+  }));
+}
+
+function nodeRadius(role: NodeRole, node: TreeNode, focusedNode: TreeNode) {
+  if (role === "focus") {
+    return FOCUS_RADIUS;
+  }
+
+  if (role === "parent") {
+    return PARENT_RADIUS;
+  }
+
+  if (role === "ancestor") {
+    return PARENT_RADIUS - 6;
+  }
+
+  if (role === "child") {
+    // Earlier children are the closest relations, so they read as slightly larger bodies.
+    return CHILD_RADIUS - node.childIndex * 2.5;
+  }
+
+  return GHOST_RADIUS;
+}
+
+function isInteractiveRole(role: NodeRole) {
+  return role !== "ghost";
+}
+
+function nodeClassName(role: NodeRole, childrenStatus?: ChildrenStatus) {
+  return ["node", `node-${role}`, isInteractiveRole(role) ? "node-button" : "", childrenStatus === "loading" ? "node-loading" : ""].filter(Boolean).join(" ");
+}
+
+function truncateLabel(value: string, maxLength: number) {
+  return value.length > maxLength ? `${value.slice(0, maxLength - 1)}...` : value;
+}
+
+function labelLines(label: string) {
+  const words = label.split(/\s+/).filter(Boolean);
+  const lines: string[] = [];
+
+  for (const word of words) {
+    if (lines.length === 0) {
+      lines.push(word);
+      continue;
+    }
+
+    const currentLine = lines[lines.length - 1] ?? "";
+    const candidate = currentLine ? `${currentLine} ${word}` : word;
+
+    if (candidate.length <= 14) {
+      lines[lines.length - 1] = candidate;
+    } else if (lines.length < 2) {
+      lines.push(word);
+    }
+  }
+
+  return (lines.length > 0 ? lines : [label]).slice(0, 2).map((line) => truncateLabel(line, 15));
+}
+
+function hashText(value: string) {
+  let hash = 0;
+
+  for (let index = 0; index < value.length; index += 1) {
+    hash = (hash * 31 + value.charCodeAt(index)) >>> 0;
+  }
+
+  return hash;
+}
+
+function nodeStyle(node: TreeNode, radius: number, cameraScale: number) {
+  const seed = hashText(node.id);
+  const inverseCameraScale = 1 / cameraScale;
+  const worldRadius = radius * inverseCameraScale;
+  const driftX = (2.4 + (seed % 13) * 0.22) * inverseCameraScale;
+  const driftY = (2.2 + ((seed >> 5) % 13) * 0.2) * inverseCameraScale;
+  const duration = 9 + ((seed >> 10) % 18) * 0.32;
+  const delay = -1 * (((seed >> 16) % 40) * 0.16);
+
+  return {
+    height: `${(worldRadius * 2 * 100) / SIZE}%`,
+    left: `${(node.x * 100) / SIZE}%`,
+    top: `${(node.y * 100) / SIZE}%`,
+    width: `${(worldRadius * 2 * 100) / SIZE}%`,
+    "--node-drift-duration": `${duration.toFixed(2)}s`,
+    "--node-drift-delay": `${delay.toFixed(2)}s`,
+    "--node-drift-x-a": `${driftX.toFixed(2)}px`,
+    "--node-drift-y-a": `${(-driftY * 0.45).toFixed(2)}px`,
+    "--node-drift-x-b": `${(-driftX * 0.72).toFixed(2)}px`,
+    "--node-drift-y-b": `${driftY.toFixed(2)}px`,
+    "--node-text-scale": inverseCameraScale.toFixed(4)
+  } as Record<string, string>;
+}
+
+function cameraStyle(camera: Camera) {
+  return {
+    transform: `translate(${(camera.x * 100) / SIZE}%, ${(camera.y * 100) / SIZE}%) scale(${camera.scale})`
+  };
+}
+
+function delay(milliseconds: number) {
+  return new Promise<void>((resolve) => {
+    setTimeout(resolve, milliseconds);
+  });
+}
+
+function useAnimatedCamera(target: Camera, onRest?: () => void) {
+  const [camera, setCamera] = useState<Camera>(target);
+  const cameraRef = useRef(target);
+  const onRestRef = useRef(onRest);
+
+  useEffect(() => {
+    onRestRef.current = onRest;
+  }, [onRest]);
+
+  useEffect(() => {
+    const start = cameraRef.current;
+    const distance = Math.hypot(target.x - start.x, target.y - start.y);
+    const duration = Math.min(1650, Math.max(900, distance * 2.2));
+    let frame = 0;
+
+    if (distance < 0.5 || (typeof window !== "undefined" && typeof window.matchMedia === "function" && window.matchMedia("(prefers-reduced-motion: reduce)").matches)) {
+      cameraRef.current = target;
+      setCamera(target);
+      onRestRef.current?.();
       return;
     }
 
-    await addTodo(text);
-    form.reset();
-  }
+    function tick(startTime: number, now: number) {
+      const progress = Math.min(1, (now - startTime) / duration);
+      const eased = easeInOutCubic(progress);
+      const next = {
+        scale: start.scale + (target.scale - start.scale) * eased,
+        x: start.x + (target.x - start.x) * eased,
+        y: start.y + (target.y - start.y) * eased
+      };
 
-  return (
-    <section>
-      <h1 className="mb-8 text-5xl font-bold tracking-tight">recursive-app</h1>
-      <form className="mb-8 flex gap-3" onSubmit={(event) => void onSubmit(event)}>
-        <input className="min-w-0 flex-1 border border-neutral-700 bg-black px-3 py-2 text-white outline-none focus:border-white" name="text" placeholder="Add a todo" />
-        <button className="border border-white px-4 py-2 font-medium" type="submit">Add</button>
-      </form>
-      <ul className="divide-y divide-neutral-800 border-y border-neutral-800">
-        {todos.map((todo) => (
-          <li className="py-3" key={todo.id}>{todo.text}</li>
-        ))}
-      </ul>
-    </section>
-  );
+      cameraRef.current = next;
+      setCamera(next);
+
+      if (progress < 1) {
+        frame = requestAnimationFrame((nextTime) => tick(startTime, nextTime));
+      } else {
+        cameraRef.current = target;
+        setCamera(target);
+        onRestRef.current?.();
+      }
+    }
+
+    frame = requestAnimationFrame((startTime) => tick(startTime, startTime));
+
+    return () => {
+      cancelAnimationFrame(frame);
+    };
+  }, [target.scale, target.x, target.y]);
+
+  return camera;
 }
 
-function StatusPage() {
-  const [status, setStatus] = useState("not checked");
+const DEFAULT_TINT = "hsl(232 62% 74%)";
+// Deezer's API terms require a clearly visible Deezer logo; this is the official mark from deezerbrand.com.
+const DEEZER_MARK = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAAACXBIWXMAAAPoAAAD6AG1e1JrAAAGyklEQVR42uVbaYwURRQeWBGVcAkoEQTWCCIiaALOqzXK+gNBRTQY1CAqChoBfxhUEjwwEA4D4kVcgjEs/WoWUQNEg8ghyA/QeGCUiEi4IgKLICK3uLDPeT01UhbdPd2903NRyfux1bX1Xn1V9epdE4uFaBKoHwLtQaDvE4I6xvLYJNDjCHQYgT6SQM2iZxinNgi0E4FI0UoJ1Cgfi0egXgh0SpNl6pJKipzpBI0h02kJdFueAPjQkOWgFNQput0XdBECbTKYMr1vjq0R1DQhqHVDeS4AKpOCLnM4+p0Q6KSDLOOyeb+eRqBFCaAWCvGbeMcdmDLyrdL/l6iwgfoYgXZLoN4N3OVpCHRAAg03+kc7yMG0LlFBZfaYuK2r1kigzmEW3wWBjqlJn1NMJ7owrUeggdr/jlJ9/G3NkspwOkIC9UCgOjXPXhTUTgPgExdZjqGgjlJQEwTarPoSYZB/Xpt0IwKV8WJcmDJNU0JfgEDfav11EujGkLtfZfAYZZ8wQRcj0D5XWQTdh4L6I9AZ1XdYCro8KPO12qR/oyCBQLUeAHyh/q+noZmZJgVdfE2FDeReY57PNO3/j4csryHQLL1PAg0NsviWCPSXMekM7Vg7US0Kapa8r2Mdvn0V9Hly0TesC9omn+FHPeRgWm2cQqa3g2j7vg7Md2dgehIFdUOghQ7fDqOgNgEBeMZR1wi6BYFmZpDlgH1qDeUYhPnwDAzcaDACbXHo57t4a0AAalx4PItAn4aQbQ/G6RJHZgmg5hKog8b8lZAATFdmqdO30QEB2OQyD2raPQgdRUFd1Akvk0BdbQs2AdQIgSxmKM++9/NCAvClx7cqB+DbKYXWxLiCrRx0UJp+UUc8qGx8Cvuo9T2QfOWOSyDgZ4tt++NKwQ1WA1aFBKDO49sqB4eqVumaZTWaIZVBy5/WnregdLeaf4X6+z0W5A5twCw14IeQDLxoWzVQY82MNd/xOWmDCYEGRcCfaSSmTtfv6u/tzGy8NmA5C4lAv0bA/A+MU1sFQJXDd7Y14gqAMREBMF4CXaedrjPMbLY2gBVP8wwGT1hix6Wb2v0jbgquGohlmhoRADzv7XofM/tA6+Cdv9LerewzZx0TZ7/CY8xBBGqvlHIUALyFQMNMAJZqHWx6dkegQxEJcG+Gl4LpYU1JZZveTdoDT5gALNcBsICu9XiCGkqT7ffYe8wCDrVFxB8toCdNABbr5q6VcmaORiTANz7G7Az5zvshmbzmj5kA6EbPdguoa4QAnPGpK+ojBGCICcA0fYcsoCsivAL5puqkfhE6wAzACG3AQiulhQ+VKABzky9MuRbpOsJGSS9tALugl0Z4B/NNb2KFHSpLe6xrYxbYHVuVodJTpsJNe0sUgMnK0nwjveFp54P9+IlsBitTeEeJAjBOrbczAs23gFq6+eLflSgAI/wGI5aVKAB3+gVgbgkunuMIvf0CMKEEAeBQXQe/ANxfggDsqhF0oV8Ars+QeChGWuk7ImuBbQvsLzEApgfNzCz9X7jqbBytWGiH4YQNCAqA7jev88jGFiq9pGW3ajGeCvkHAaC1ityy5/QIAr1eRIuvl0BXI9B69ffMsMUJAxDoRSuV8n6qiADgmGYLFHZ9AecRW2WjHqdfEQGwgTct2wVJ7TNEitiFPpGjBe7OEDWal/UCKeU2/+jBdHEOX4oFHrkFrhAZE1VZ2hwPoTibsy1HALCpvsEj7tgrKgCGuDA9YQk7mJorN3qER/ZoqyVc6gCypAecskZfq0BKrmyF/lYquOlUsjc7skLJ6ko7iIoOTMcqgN7JxRuPgrrLVNXaz2Z6XgJVRF2c3Meo0NyXfmc55JQDADhi3U4pZrNYarVlFFtEAUAjZVzUqyM4VLsi9+QAgC1csqsAKNPqhfZHpvzOeRJvti3Du5LM+3I6WwOgh8u9zCat0EvulOf6IKfeY/lumv/gXKQUbKHHXfpnxQq1VVfa18Mp/X3KcK/95AcXuXwbFivkZpaoKvrNpfDRq1BipIO5y3GJawodgEEOgnMVSv8AAGxUOTyz2nMzCmpa6AC0NYwlBuMhTJXf1/kEYJGaa33oet88g4CGb94ShV18tcsnAJPUPGMNPQLFAsANWgp6iip/5/7P/QAgVcEm/wpM6Q9Sv0BpXBQAKJOZdcHL8+FsLB6BXvUBwClLUPl/73zcDtHP8J3UKPCTMdAHAJsKXtE1IKjC3uSfGQCoipVqU4bS8gwG0KBYKTejJumc/J1r0UIJXYM2HrXIM2PnQ1MVo+biWTeUnxcAWKlfpf1k3P0XYudTs4CuUp4jG0xT5kcdyXFp/wKYw2+/dkATvAAAAABJRU5ErkJggg==";
+const tintCache = new Map<string, string | null>();
+const tintListeners = new Set<() => void>();
 
-  async function checkStatus() {
-    const response = await fetch("api/status");
-    setStatus(response.ok ? await response.text() : "error " + response.status);
+function proceduralHues(seed: string) {
+  const hash = hashText(seed);
+  const hue = hash % 360;
+
+  return { hash, hue, accent: (hue + 20 + ((hash >>> 8) % 60)) % 360 };
+}
+
+function proceduralTint(seed: string) {
+  return `hsl(${proceduralHues(seed).accent} 62% 66%)`;
+}
+
+// Artists without a photo become a small generated world (a banded gas giant or a cratered moon),
+// seeded by their id so the same artist always looks the same.
+function ProceduralPlanet({ seed }: { seed: string }) {
+  const { hash, hue, accent } = proceduralHues(seed);
+  const isGasGiant = (hash >>> 14) % 3 !== 0;
+  let background: string;
+
+  if (isGasGiant) {
+    const tilt = -24 + ((hash >>> 4) % 48);
+    const storm = (hash >>> 20) % 2 === 0;
+    const stormX = 30 + ((hash >>> 22) % 40);
+    const stormY = 35 + ((hash >>> 25) % 30);
+    background = [
+      storm ? `radial-gradient(9% 6% at ${stormX}% ${stormY}%, hsl(${accent} 62% 70% / 0.85), hsl(${accent} 50% 50% / 0.35) 60%, transparent 100%)` : "",
+      `radial-gradient(120% 70% at 30% 30%, hsl(${accent} 70% 72% / 0.22), transparent 60%)`,
+      `repeating-linear-gradient(${tilt}deg, hsl(${hue} 40% 26%) 0%, hsl(${accent} 46% 42%) 5%, hsl(${hue} 36% 33%) 9%, hsl(${accent} 40% 56%) 12%, hsl(${hue} 42% 28%) 17%, hsl(${hue} 40% 26%) 24%)`
+    ]
+      .filter(Boolean)
+      .join(", ");
+  } else {
+    const craters = Array.from({ length: 4 }, (_, index) => {
+      const bits = hash >>> (index * 6);
+      const x = 22 + (bits % 56);
+      const y = 22 + ((bits >>> 3) % 56);
+      const radius = 6 + ((bits >>> 2) % 9);
+      return `radial-gradient(circle at ${x}% ${y}%, hsl(${hue} 22% 16% / 0.55) 0 ${radius}%, hsl(${hue} 24% 72% / 0.2) ${radius + 1}%, transparent ${radius + 3}%)`;
+    });
+    background = [...craters, `radial-gradient(circle at 40% 35%, hsl(${hue} 16% 54%), hsl(${hue} 22% 24%) 78%)`].join(", ");
   }
 
-  return (
-    <section>
-      <h1 className="mb-4 text-4xl font-bold tracking-tight">Status</h1>
-      <p className="mb-6 text-neutral-400">This route calls the server endpoint at /api/status.</p>
-      <button className="border border-white px-4 py-2 font-medium" type="button" onClick={() => void checkStatus()}>
-        Check endpoint
-      </button>
-      <p className="mt-4 font-mono text-sm text-neutral-400">endpoint: {status}</p>
-    </section>
-  );
+  return <span aria-hidden="true" className={`planet-procedural${isGasGiant ? " planet-procedural-gas" : ""}`} style={{ background }} />;
+}
+
+function shiftHue(tint: string, degrees: number) {
+  const match = /hsl\((\d+) (\d+)% (\d+)%\)/.exec(tint);
+  if (!match) {
+    return tint;
+  }
+
+  return `hsl(${(Number(match[1]) + degrees) % 360} ${match[2]}% ${match[3]}%)`;
+}
+
+function prefersReducedMotion() {
+  return typeof window !== "undefined" && typeof window.matchMedia === "function" && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+}
+
+// Pull a luminous hue out of an artist portrait so each planet (and the nebula around the focused one) glows in its own color.
+function extractTint(image: HTMLImageElement) {
+  const canvas = document.createElement("canvas");
+  const size = 24;
+  canvas.width = size;
+  canvas.height = size;
+  const context = canvas.getContext("2d", { willReadFrequently: true });
+  if (!context) {
+    return null;
+  }
+
+  context.drawImage(image, 0, 0, size, size);
+  const pixels = context.getImageData(0, 0, size, size).data;
+  let hueX = 0;
+  let hueY = 0;
+  let weightTotal = 0;
+  let saturationTotal = 0;
+
+  for (let index = 0; index < pixels.length; index += 4) {
+    const red = pixels[index] / 255;
+    const green = pixels[index + 1] / 255;
+    const blue = pixels[index + 2] / 255;
+    const max = Math.max(red, green, blue);
+    const min = Math.min(red, green, blue);
+    const lightness = (max + min) / 2;
+    const chroma = max - min;
+
+    if (chroma < 0.08 || lightness < 0.08 || lightness > 0.94) {
+      continue;
+    }
+
+    const saturation = chroma / (1 - Math.abs(2 * lightness - 1));
+    let hue = 0;
+    if (max === red) {
+      hue = ((green - blue) / chroma) % 6;
+    } else if (max === green) {
+      hue = (blue - red) / chroma + 2;
+    } else {
+      hue = (red - green) / chroma + 4;
+    }
+
+    const radians = (hue * 60 * Math.PI) / 180;
+    const weight = saturation * chroma;
+    hueX += Math.cos(radians) * weight;
+    hueY += Math.sin(radians) * weight;
+    saturationTotal += saturation * weight;
+    weightTotal += weight;
+  }
+
+  if (weightTotal < 6) {
+    return null;
+  }
+
+  const hue = ((Math.atan2(hueY, hueX) * 180) / Math.PI + 360) % 360;
+  const saturation = Math.round(Math.min(88, Math.max(62, (saturationTotal / weightTotal) * 100)));
+  return `hsl(${Math.round(hue)} ${saturation}% 66%)`;
+}
+
+function requestTint(url: string) {
+  if (tintCache.has(url)) {
+    return;
+  }
+
+  tintCache.set(url, null);
+  const image = new Image();
+  image.crossOrigin = "anonymous";
+  image.onload = () => {
+    try {
+      tintCache.set(url, extractTint(image));
+    } catch {
+      tintCache.set(url, null);
+    }
+
+    tintListeners.forEach((listener) => listener());
+  };
+  image.src = url;
+}
+
+function useTints(urls: string[]) {
+  const [, setVersion] = useState(0);
+  const key = urls.join("|");
+
+  useEffect(() => {
+    const listener = () => setVersion((version) => version + 1);
+    tintListeners.add(listener);
+
+    return () => {
+      tintListeners.delete(listener);
+    };
+  }, []);
+
+  useEffect(() => {
+    urls.forEach(requestTint);
+  }, [key]);
+
+  return (url?: string) => (url ? tintCache.get(url) ?? DEFAULT_TINT : DEFAULT_TINT);
+}
+
+type Star = { x: number; y: number; radius: number; alpha: number; twinkle: number; phase: number; layer: number; warm: boolean };
+
+const STAR_TILE = 1400;
+const STAR_LAYERS = [
+  { count: 520, depth: 0.06, size: [0.3, 0.75], alpha: [0.16, 0.5] },
+  { count: 170, depth: 0.16, size: [0.5, 1.1], alpha: [0.3, 0.75] },
+  { count: 42, depth: 0.36, size: [0.9, 1.8], alpha: [0.55, 1] }
+];
+
+function seededRandom(seed: number) {
+  let state = seed;
+  return () => {
+    state = (state * 1664525 + 1013904223) >>> 0;
+    return state / 4294967296;
+  };
+}
+
+function frameSizeFor(width: number, height: number) {
+  return width <= 640 ? Math.min(width, height * 0.78) : Math.min(Math.min(width, height) * 0.94, width - 24, 960);
+}
+
+function Starfield({ camera }: { camera: Camera }) {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const cameraRef = useRef(camera);
+  cameraRef.current = camera;
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    const context = canvas?.getContext("2d");
+    if (!canvas || !context) {
+      return;
+    }
+
+    const random = seededRandom(11);
+    const stars: Star[] = STAR_LAYERS.flatMap((layer, layerIndex) =>
+      Array.from({ length: layer.count }, () => ({
+        x: random() * STAR_TILE,
+        y: random() * STAR_TILE,
+        radius: layer.size[0] + random() * (layer.size[1] - layer.size[0]),
+        alpha: layer.alpha[0] + random() * (layer.alpha[1] - layer.alpha[0]),
+        twinkle: 0.4 + random() * 1.4,
+        phase: random() * Math.PI * 2,
+        layer: layerIndex,
+        warm: random() < 0.16
+      }))
+    );
+    const reduceMotion = prefersReducedMotion();
+    let width = 0;
+    let height = 0;
+    let frame = 0;
+
+    function resize() {
+      const ratio = Math.min(2, window.devicePixelRatio || 1);
+      width = window.innerWidth;
+      height = window.innerHeight;
+      canvas!.width = Math.round(width * ratio);
+      canvas!.height = Math.round(height * ratio);
+      context!.setTransform(ratio, 0, 0, ratio, 0, 0);
+    }
+
+    function draw(now: number) {
+      const activeCamera = cameraRef.current;
+      const pxPerUnit = frameSizeFor(width, height) / SIZE;
+      const centerX = ((CENTER - activeCamera.x) / activeCamera.scale) * pxPerUnit;
+      const centerY = ((CENTER - activeCamera.y) / activeCamera.scale) * pxPerUnit;
+
+      const drift = reduceMotion ? 0 : now * 0.006;
+      const seconds = now / 1000;
+      context!.clearRect(0, 0, width, height);
+
+      for (const star of stars) {
+        const depth = STAR_LAYERS[star.layer].depth;
+        const offsetX = centerX * depth * 1.2 + drift * depth * 10;
+        const offsetY = centerY * depth * 1.2 + drift * depth * 4;
+        const baseX = (((star.x - offsetX) % STAR_TILE) + STAR_TILE) % STAR_TILE;
+        const baseY = (((star.y - offsetY) % STAR_TILE) + STAR_TILE) % STAR_TILE;
+        const alpha = reduceMotion ? star.alpha : star.alpha * (0.62 + 0.38 * Math.sin(seconds * star.twinkle + star.phase));
+        const color = star.warm ? `rgba(255, 216, 196, ${alpha.toFixed(3)})` : `rgba(226, 230, 255, ${alpha.toFixed(3)})`;
+
+        for (let x = baseX; x < width; x += STAR_TILE) {
+          for (let y = baseY; y < height; y += STAR_TILE) {
+            context!.fillStyle = color;
+            context!.beginPath();
+            context!.arc(x, y, star.radius, 0, Math.PI * 2);
+            context!.fill();
+
+            if (star.layer === 2) {
+              context!.fillStyle = star.warm ? `rgba(255, 190, 160, ${(alpha * 0.1).toFixed(3)})` : `rgba(190, 200, 255, ${(alpha * 0.1).toFixed(3)})`;
+              context!.beginPath();
+              context!.arc(x, y, star.radius * 4, 0, Math.PI * 2);
+              context!.fill();
+            }
+          }
+        }
+      }
+
+      frame = requestAnimationFrame(draw);
+    }
+
+    resize();
+    window.addEventListener("resize", resize);
+    frame = requestAnimationFrame(draw);
+
+    return () => {
+      cancelAnimationFrame(frame);
+      window.removeEventListener("resize", resize);
+    };
+  }, []);
+
+  return <canvas aria-hidden="true" className="starfield" ref={canvasRef} />;
+}
+
+function formatFans(fans?: number) {
+  if (!fans) {
+    return "Deezer artist";
+  }
+
+  const compact = fans >= 1_000_000 ? `${(fans / 1_000_000).toFixed(fans >= 10_000_000 ? 0 : 1)}M` : fans >= 1000 ? `${(fans / 1000).toFixed(fans >= 10_000 ? 0 : 1)}K` : String(fans);
+  return `${compact.replace(".0", "")} ${fans === 1 ? "fan" : "fans"}`;
+}
+
+function routeTo(tree: TreeState, node: TreeNode) {
+  const route: TreeNode[] = [];
+  let current: TreeNode | undefined = node;
+
+  while (current) {
+    route.unshift(current);
+    current = current.parentId ? tree[current.parentId] : undefined;
+  }
+
+  return route;
 }
 
 export function App() {
-  const auth = useAuth();
-  const authLabel = auth.displayName;
-  const authStatus = auth.isLoading && auth.isGuest ? "checking session" : "signed in as " + authLabel;
+  const artistRoot = useQuery<ArtistNeighborhoodResult>("artistRoot");
+  const searchArtists = useMutation<[term: string], ArtistSearchResult>("searchArtists");
+  const loadRootArtist = useMutation<[artistId: string], ArtistNeighborhoodResult>("loadRootArtist");
+  const loadRelatedArtists = useMutation<[artistId: string], ArtistNeighborhoodResult>("loadRelatedArtists");
+  const [tree, setTree] = useState<TreeState>(() => createInitialTree());
+  const [focusId, setFocusId] = useState(rootNode.id);
+  const [cameraFocusId, setCameraFocusId] = useState(rootNode.id);
+  const [loadError, setLoadError] = useState<string | undefined>();
+  const [coreArtistId, setCoreArtistId] = useState(kendrickLamarFallback.id);
+  const [artistSearchText, setArtistSearchText] = useState("");
+  const [artistSearchResults, setArtistSearchResults] = useState<ArtistSummary[]>([]);
+  const [artistSearchStatus, setArtistSearchStatus] = useState<SearchStatus>("idle");
+  const [artistSearchError, setArtistSearchError] = useState<string | undefined>();
+  const [isArtistPickerOpen, setIsArtistPickerOpen] = useState(false);
+  const [rootLoadId, setRootLoadId] = useState<string | undefined>();
+  const treeRef = useRef(tree);
+  const pendingLoadsRef = useRef<Map<string, Promise<boolean>>>(new Map());
+  const preloadFocusRef = useRef<string>();
+  const requestQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const neighborhoodRequestsRef = useRef<Map<string, { promise: Promise<ArtistNeighborhoodResult>; start: () => void }>>(new Map());
+  const [hoveredId, setHoveredId] = useState<string | undefined>();
+  const searchRequestIdRef = useRef(0);
+  const rootLoadRequestIdRef = useRef(0);
+  const artistSearchInputRef = useRef<HTMLInputElement>(null);
+  const focusedNode = tree[focusId] ?? rootNode;
+  const cameraFocusedNode = tree[cameraFocusId] ?? focusedNode;
+  const isTraveling = focusId !== cameraFocusId;
+  const roles = useMemo(() => buildNodeRoles(tree, focusedNode), [tree, focusedNode]);
+  const edges = useMemo(() => buildEdges(tree, roles), [tree, roles]);
+  const previewEdges = useMemo(() => buildProjectedPreviewEdges(tree, focusedNode), [tree, focusedNode]);
+  const orbitRings = useMemo(() => buildOrbitRings(tree, focusedNode), [tree, focusedNode]);
+  const targetCamera = useMemo(() => cameraFor(tree, cameraFocusedNode), [tree, cameraFocusedNode]);
+  const camera = useAnimatedCamera(targetCamera, () => setFocusId(cameraFocusId));
+  const loadedNodes = useMemo(() => Object.values(tree).sort((a, b) => a.depth - b.depth || a.id.localeCompare(b.id)), [tree]);
+  const trimmedArtistSearchText = artistSearchText.trim();
+  const showArtistSearchPanel =
+    isArtistPickerOpen && (trimmedArtistSearchText.length >= 2 || artistSearchResults.length > 0 || artistSearchStatus !== "idle" || Boolean(artistSearchError));
+  const renderedNodes = loadedNodes;
+  const tintFor = useTints(renderedNodes.map((node) => node.imageUrl).filter((url): url is string => Boolean(url)));
+  const route = useMemo(() => routeTo(tree, cameraFocusedNode), [tree, cameraFocusedNode]);
+  const aura = cameraFocusedNode.imageUrl ? tintFor(cameraFocusedNode.imageUrl) : proceduralTint(cameraFocusedNode.artistId);
+  const cameraDriftX = (CENTER - camera.x) / camera.scale - CENTER;
+  const cameraDriftY = (CENTER - camera.y) / camera.scale - CENTER;
+
+  useEffect(() => {
+    treeRef.current = tree;
+  }, [tree]);
+
+  useEffect(() => {
+    function handleGlobalKeyDown(event: KeyboardEvent) {
+      if (!(event.metaKey || event.ctrlKey) || event.key.toLowerCase() !== "k") {
+        return;
+      }
+
+      event.preventDefault();
+      focusArtistSearchInput({ selectText: true });
+    }
+
+    window.addEventListener("keydown", handleGlobalKeyDown);
+
+    return () => {
+      window.removeEventListener("keydown", handleGlobalKeyDown);
+    };
+  }, []);
+
+  useEffect(() => {
+    const term = artistSearchText.trim();
+
+    if (!isArtistPickerOpen || term.length < 2) {
+      setArtistSearchStatus("idle");
+      setArtistSearchError(undefined);
+      setArtistSearchResults([]);
+      return;
+    }
+
+    const requestId = searchRequestIdRef.current + 1;
+    searchRequestIdRef.current = requestId;
+    setArtistSearchStatus("searching");
+    setArtistSearchError(undefined);
+
+    const timeout = setTimeout(() => {
+      void (async () => {
+        let result: ArtistSearchResult;
+        try {
+          result = await searchArtists(term);
+        } catch (error) {
+          result = {
+            ok: false,
+            error: error instanceof Error ? error.message : "Unable to search Deezer artists."
+          };
+        }
+
+        if (searchRequestIdRef.current !== requestId) {
+          return;
+        }
+
+        if (!result.ok) {
+          setArtistSearchStatus("error");
+          setArtistSearchError(result.error);
+          setArtistSearchResults([]);
+          return;
+        }
+
+        setArtistSearchStatus("idle");
+        setArtistSearchResults(result.data);
+      })();
+    }, 320);
+
+    return () => {
+      clearTimeout(timeout);
+    };
+  }, [artistSearchText, isArtistPickerOpen]);
+
+  useEffect(() => {
+    if (!artistRoot) {
+      return;
+    }
+
+    if (coreArtistId !== kendrickLamarFallback.id) {
+      return;
+    }
+
+    if (!artistRoot.ok) {
+      setLoadError(artistRoot.error);
+      setTree((currentTree) => setNodeChildrenStatus(currentTree, rootNode.id, "error", artistRoot.error));
+      return;
+    }
+
+    setLoadError(undefined);
+    setTree((currentTree) => attachChildren(updateNodeArtist(currentTree, rootNode.id, artistRoot.data.artist), rootNode.id, artistRoot.data.related));
+  }, [artistRoot, coreArtistId]);
+
+  useEffect(() => {
+    if (isTraveling) {
+      return;
+    }
+
+    if (preloadFocusRef.current === focusedNode.id) {
+      return;
+    }
+
+    // Prefetch every orbiting artist so a click almost never waits on the network.
+    const candidates = getChildren(tree, focusedNode).filter((node) => node.childrenStatus === "idle");
+    if (candidates.length === 0) {
+      return;
+    }
+
+    preloadFocusRef.current = focusedNode.id;
+    for (const candidate of candidates) {
+      void loadNodeNeighborhood(candidate.id, { showError: false, showLoading: false });
+    }
+  }, [tree, focusedNode, isTraveling]);
+
+  // Background loads run one at a time; a priority request (hover or click) starts immediately and the
+  // queue simply reuses its result when that artist's turn comes up.
+  function requestNeighborhood(artistId: string, priority: boolean) {
+    let entry = neighborhoodRequestsRef.current.get(artistId);
+
+    if (!entry) {
+      let started = false;
+      let start = () => {};
+      const promise = new Promise<ArtistNeighborhoodResult>((resolve) => {
+        start = () => {
+          if (started) {
+            return;
+          }
+
+          started = true;
+          loadRelatedArtists(artistId).then(resolve, (error: unknown) =>
+            resolve({
+              ok: false,
+              error: error instanceof Error ? error.message : "Unable to load artist data from Deezer."
+            })
+          );
+        };
+      });
+      const createdEntry = { promise, start };
+      entry = createdEntry;
+      neighborhoodRequestsRef.current.set(artistId, createdEntry);
+      void promise.then(() => {
+        if (neighborhoodRequestsRef.current.get(artistId) === createdEntry) {
+          neighborhoodRequestsRef.current.delete(artistId);
+        }
+      });
+
+      requestQueueRef.current = requestQueueRef.current
+        .then(() => delay(LOAD_THROTTLE_MS))
+        .then(() => {
+          createdEntry.start();
+          return createdEntry.promise;
+        })
+        .then(() => undefined);
+    }
+
+    if (priority) {
+      entry.start();
+    }
+
+    return entry.promise;
+  }
+
+  function handleNodeHover(nodeId: string) {
+    setHoveredId(nodeId);
+    void loadNodeNeighborhood(nodeId, { showError: false, showLoading: false, priority: true });
+  }
+
+  async function loadNodeNeighborhood(nodeId: string, options: { showError: boolean; showLoading: boolean; priority?: boolean }) {
+    const node = treeRef.current[nodeId];
+    if (!node) {
+      return false;
+    }
+
+    if (node.childrenStatus === "loaded") {
+      return true;
+    }
+
+    const pendingLoad = pendingLoadsRef.current.get(nodeId);
+    if (pendingLoad) {
+      if (options.priority) {
+        requestNeighborhood(node.artistId, true);
+      }
+
+      if (options.showLoading) {
+        setTree((currentTree) => setNodeChildrenStatus(currentTree, nodeId, "loading"));
+      }
+
+      return pendingLoad;
+    }
+
+    if (options.showError) {
+      setLoadError(undefined);
+    }
+
+    if (options.showLoading) {
+      setTree((currentTree) => setNodeChildrenStatus(currentTree, nodeId, "loading"));
+    }
+
+    const loadPromise = (async () => {
+      const result = await requestNeighborhood(node.artistId, Boolean(options.priority));
+
+      if (!result.ok) {
+        if (options.showError) {
+          setLoadError(result.error);
+        }
+
+        setTree((currentTree) => setNodeChildrenStatus(currentTree, nodeId, "error", result.error));
+        return false;
+      }
+
+      if (options.showError) {
+        setLoadError(undefined);
+      }
+
+      setTree((currentTree) => attachChildren(updateNodeArtist(currentTree, nodeId, result.data.artist), nodeId, result.data.related));
+      return true;
+    })();
+
+    pendingLoadsRef.current.set(nodeId, loadPromise);
+
+    try {
+      return await loadPromise;
+    } finally {
+      pendingLoadsRef.current.delete(nodeId);
+    }
+  }
+
+  function focusNode(nodeId: string) {
+    const node = tree[nodeId];
+    if (!node || isTraveling) {
+      return;
+    }
+
+    if (nodeId === cameraFocusId) {
+      if (node.childrenStatus === "error") {
+        void loadNodeNeighborhood(nodeId, { showError: true, showLoading: true, priority: true });
+      }
+
+      return;
+    }
+
+    // Start flying right away; the flight itself covers most of the load time.
+    void loadNodeNeighborhood(nodeId, { showError: true, showLoading: true, priority: true });
+    setHoveredId(undefined);
+    setCameraFocusId(nodeId);
+  }
+
+  function handleArtistSearchSubmit(event: SubmitEvent) {
+    event.preventDefault();
+    const firstArtist = artistSearchResults[0];
+
+    if (firstArtist) {
+      void chooseCoreArtist(firstArtist);
+    }
+  }
+
+  function focusArtistSearchInput(options: { selectText?: boolean } = {}) {
+    setIsArtistPickerOpen(true);
+
+    requestAnimationFrame(() => {
+      artistSearchInputRef.current?.focus();
+
+      if (options.selectText) {
+        artistSearchInputRef.current?.select();
+      }
+    });
+  }
+
+  function handleArtistSearchKeyDown(event: KeyboardEvent) {
+    if (event.key === "Escape") {
+      setIsArtistPickerOpen(false);
+      artistSearchInputRef.current?.blur();
+    }
+  }
+
+  async function chooseCoreArtist(artist: ArtistSummary) {
+    const requestId = rootLoadRequestIdRef.current + 1;
+    rootLoadRequestIdRef.current = requestId;
+    pendingLoadsRef.current.clear();
+    neighborhoodRequestsRef.current.clear();
+    setHoveredId(undefined);
+    preloadFocusRef.current = undefined;
+    requestQueueRef.current = Promise.resolve();
+    searchRequestIdRef.current += 1;
+
+    const loadingCore = makeRootNode(artist, "loading");
+    setCoreArtistId(artist.id);
+    setArtistSearchText(artist.name);
+    setArtistSearchResults([]);
+    setArtistSearchStatus("idle");
+    setArtistSearchError(undefined);
+    setIsArtistPickerOpen(false);
+    artistSearchInputRef.current?.blur();
+    setRootLoadId(artist.id);
+    setLoadError(undefined);
+    setFocusId(rootNode.id);
+    setCameraFocusId(rootNode.id);
+    setTree({ [loadingCore.id]: loadingCore });
+
+    let result: ArtistNeighborhoodResult;
+    try {
+      result = await loadRootArtist(artist.id);
+    } catch (error) {
+      result = {
+        ok: false,
+        error: error instanceof Error ? error.message : "Unable to load artist data from Deezer."
+      };
+    }
+
+    if (rootLoadRequestIdRef.current !== requestId) {
+      return;
+    }
+
+    setRootLoadId(undefined);
+
+    if (!result.ok) {
+      setLoadError(result.error);
+      setTree((currentTree) => setNodeChildrenStatus(currentTree, rootNode.id, "error", result.error));
+      return;
+    }
+
+    setLoadError(undefined);
+    setCoreArtistId(result.data.artist.id);
+    setTree((currentTree) => attachChildren(updateNodeArtist(currentTree, rootNode.id, result.data.artist), rootNode.id, result.data.related));
+  }
+
+  function renderArtistNode(node: TreeNode, role: NodeRole, radius: number, cameraScale: number, options: { interactive: boolean }) {
+    const isFocus = role === "focus";
+    const isReachable = isInteractiveRole(role);
+    const lines = isFocus ? [node.label] : labelLines(node.label);
+    const isLoading = node.childrenStatus === "loading";
+    const parent = node.parentId ? tree[node.parentId] : undefined;
+    const worldDiameter = (radius / cameraScale) * 2;
+    const style = {
+      ...nodeStyle(node, radius, cameraScale),
+      "--planet": node.imageUrl ? tintFor(node.imageUrl) : proceduralTint(node.artistId),
+      "--emerge-x": parent ? `${(((parent.x - node.x) / worldDiameter) * 100).toFixed(1)}%` : "0%",
+      "--emerge-y": parent ? `${(((parent.y - node.y) / worldDiameter) * 100).toFixed(1)}%` : "0%"
+    };
+
+    // The node you came from often sits right under the focused name, so its label moves beside it.
+    const labelSide = role === "parent" && node.y > focusedNode.y + 40;
+    const canHover = role === "child" || role === "parent" || role === "ancestor";
+    const isRetry = isFocus && node.childrenStatus === "error";
+
+    return (
+      <div
+        aria-hidden={isReachable ? undefined : "true"}
+        className={`${nodeClassName(role, node.childrenStatus)}${labelSide ? " node-label-side" : ""}`}
+        key={node.id}
+        onPointerEnter={canHover ? () => handleNodeHover(node.id) : undefined}
+        onPointerLeave={canHover ? () => setHoveredId((current) => (current === node.id ? undefined : current)) : undefined}
+        style={style}
+      >
+        <div className="node-emerge">
+          <div className="node-float">
+            {isFocus ? <span aria-hidden="true" className="corona" /> : null}
+            <button
+              aria-label={isRetry ? `Retry loading artists related to ${node.label}` : isFocus ? `${node.label}, you are here` : `Travel to ${node.label}`}
+              className="planet"
+              disabled={!options.interactive}
+              onBlur={canHover ? () => setHoveredId((current) => (current === node.id ? undefined : current)) : undefined}
+              onClick={options.interactive ? () => focusNode(node.id) : undefined}
+              onFocus={canHover ? () => handleNodeHover(node.id) : undefined}
+              tabIndex={isReachable ? undefined : -1}
+              type="button"
+            >
+              {node.imageUrl ? (
+                <img alt="" className="planet-image" crossOrigin="anonymous" draggable={false} src={node.imageUrl} />
+              ) : (
+                <ProceduralPlanet seed={node.artistId} />
+              )}
+              <span aria-hidden="true" className="planet-shade" />
+            </button>
+            {isLoading ? (
+              <span aria-hidden="true" className="satellite-orbit">
+                <span className="satellite" />
+              </span>
+            ) : null}
+            <span aria-hidden="true" className="node-name">
+              {lines.map((line) => (
+                <span key={`${node.id}-${line}`}>{line}</span>
+              ))}
+            </span>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  const jumps = route.length - 1;
+  const isDeadEnd = cameraFocusedNode.childrenStatus === "loaded" && getChildren(tree, cameraFocusedNode).length === 0;
+  const visibleRoute = route.length > 5 ? [route[0], undefined, ...route.slice(-3)] : route;
 
   return (
-    <Router>
-      <main className="min-h-screen bg-black px-6 py-10 text-white">
-        <section className="mx-auto max-w-2xl">
-          <div className="mb-3 flex items-center justify-between gap-3">
-            <div className="flex min-w-0 items-center gap-2">
-              {!auth.isLoading ? <AuthAvatar label={authLabel} picture={auth.picture} /> : null}
-              <p className="min-w-0 truncate font-mono text-sm text-neutral-500">{authStatus}</p>
+    <main className="cosmos" style={{ "--aura": aura, "--aura-2": shiftHue(aura, 46) } as Record<string, string>}>
+      <style>{`
+        @import url("https://api.fontshare.com/v2/css?f[]=clash-display@500,600&f[]=satoshi@500,700&display=swap");
+        @import url("https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&display=swap");
+
+        @property --aura {
+          syntax: "<color>";
+          inherits: true;
+          initial-value: hsl(232 62% 74%);
+        }
+
+        @property --aura-2 {
+          syntax: "<color>";
+          inherits: true;
+          initial-value: hsl(278 62% 74%);
+        }
+
+        :root {
+          --void: #04040b;
+          --ink: #eeeaf8;
+          --dust: #8e8ba8;
+          --ember: #ffb08a;
+          --ease-graph: cubic-bezier(0.22, 1, 0.36, 1);
+          --font-display: "Clash Display", ui-sans-serif, system-ui, sans-serif;
+          --font-ui: Satoshi, ui-sans-serif, system-ui, -apple-system, sans-serif;
+          --font-mono: "JetBrains Mono", ui-monospace, Menlo, monospace;
+          --fog-mask: radial-gradient(
+            circle closest-side at 50% 50%,
+            #000 0%,
+            #000 64%,
+            rgba(0, 0, 0, 0.92) 76%,
+            rgba(0, 0, 0, 0.6) 86%,
+            rgba(0, 0, 0, 0.24) 94%,
+            transparent 100%
+          );
+          color-scheme: dark;
+        }
+
+        body {
+          margin: 0;
+          background: var(--void);
+        }
+
+        .cosmos {
+          min-height: 100vh;
+          min-height: 100dvh;
+          position: relative;
+          overflow: hidden;
+          isolation: isolate;
+          background: radial-gradient(120% 90% at 50% 42%, #0b0a1d 0%, var(--void) 62%);
+          color: var(--ink);
+          font-family: var(--font-ui);
+          -webkit-font-smoothing: antialiased;
+          transition:
+            --aura 1.8s ease,
+            --aura-2 1.8s ease;
+        }
+
+        .starfield {
+          width: 100%;
+          height: 100%;
+          position: fixed;
+          inset: 0;
+          z-index: 0;
+          pointer-events: none;
+        }
+
+        .nebula {
+          position: fixed;
+          inset: -25%;
+          z-index: 0;
+          pointer-events: none;
+          background:
+            radial-gradient(28% 24% at 50% 50%, color-mix(in oklab, var(--aura) 22%, transparent), transparent 72%),
+            radial-gradient(24% 20% at 60% 40%, color-mix(in oklab, var(--aura-2) 14%, transparent), transparent 70%),
+            radial-gradient(30% 22% at 38% 62%, color-mix(in oklab, var(--aura) 10%, transparent), transparent 72%),
+            radial-gradient(18% 14% at 68% 66%, color-mix(in oklab, var(--aura-2) 8%, transparent), transparent 70%);
+          filter: blur(36px);
+          animation: nebula-breathe 22s ease-in-out infinite alternate;
+          will-change: transform;
+        }
+
+        .fog {
+          position: fixed;
+          inset: 0;
+          z-index: 3;
+          pointer-events: none;
+          background: radial-gradient(ellipse 72% 80% at 50% 50%, transparent 58%, rgba(4, 4, 11, 0.5) 86%, rgba(4, 4, 11, 0.88) 100%);
+        }
+
+        .graph-stage {
+          min-height: 100vh;
+          min-height: 100dvh;
+          position: relative;
+          z-index: 1;
+          display: grid;
+          place-items: center;
+          box-sizing: border-box;
+          padding-bottom: 56px;
+        }
+
+        .graph-frame {
+          width: min(94vmin, calc(100vw - 24px), 960px);
+          aspect-ratio: 1;
+          position: relative;
+          isolation: isolate;
+          overflow: hidden;
+        }
+
+        .graph-svg,
+        .node-html-layer {
+          position: absolute;
+          inset: 0;
+          -webkit-mask-image: var(--fog-mask);
+          mask-image: var(--fog-mask);
+        }
+
+        .graph-svg {
+          z-index: 1;
+          width: 100%;
+          height: 100%;
+          display: block;
+          overflow: visible;
+          pointer-events: none;
+        }
+
+        .node-html-layer {
+          z-index: 2;
+          pointer-events: none;
+        }
+
+        .node-world {
+          position: absolute;
+          inset: 0;
+          transform-origin: 0 0;
+          will-change: transform;
+        }
+
+        .orbit-ring {
+          fill: none;
+          stroke-linecap: round;
+          vector-effect: non-scaling-stroke;
+          transform-box: fill-box;
+          transform-origin: center;
+          animation: orbit-spin 150s linear infinite;
+          transition:
+            opacity 400ms ease,
+            stroke 900ms ease;
+        }
+
+        .orbit-ring-next {
+          stroke: color-mix(in oklab, var(--aura) 55%, transparent);
+          stroke-width: 1.3;
+          stroke-dasharray: 2 8;
+        }
+
+        .orbit-ring-current {
+          stroke: rgba(200, 204, 235, 0.26);
+          stroke-width: 1.1;
+          stroke-dasharray: 1.5 9;
+        }
+
+        .orbit-ring-inner {
+          stroke: rgba(200, 204, 235, 0.15);
+          stroke-width: 1;
+          stroke-dasharray: 1 10;
+        }
+
+        .orbit-ring-horizon {
+          stroke: rgba(200, 204, 235, 0.11);
+          stroke-width: 1;
+          stroke-dasharray: 1 12;
+        }
+
+        .edge {
+          fill: none;
+          stroke-width: 1.2;
+          stroke-linecap: round;
+          vector-effect: non-scaling-stroke;
+          transition:
+            opacity 400ms ease,
+            stroke 400ms ease;
+        }
+
+        .edge-child {
+          stroke: color-mix(in oklab, var(--aura) 46%, transparent);
+        }
+
+        .edge-parent {
+          stroke: color-mix(in oklab, var(--ember) 52%, transparent);
+          stroke-width: 1.4;
+        }
+
+        .edge-preview {
+          stroke: rgba(200, 204, 235, 0.3);
+          stroke-dasharray: 0.5 7;
+          stroke-width: 1.6;
+        }
+
+        .edge-preview-lit {
+          stroke: color-mix(in oklab, var(--aura) 60%, transparent);
+        }
+
+        .edge-route {
+          stroke: color-mix(in oklab, var(--ember) 24%, transparent);
+          stroke-dasharray: 3 6;
+        }
+
+        .node {
+          position: absolute;
+          pointer-events: auto;
+          transform: translate(-50%, -50%);
+          transform-origin: 50% 50%;
+          transition:
+            width 520ms var(--ease-graph),
+            height 520ms var(--ease-graph),
+            opacity 420ms ease,
+            transform 260ms var(--ease-graph);
+        }
+
+        .node-emerge {
+          width: 100%;
+          height: 100%;
+          animation: node-emerge 1200ms var(--ease-graph) both;
+        }
+
+        .node-float {
+          width: 100%;
+          height: 100%;
+          position: relative;
+          animation: node-drift var(--node-drift-duration) ease-in-out infinite;
+          animation-delay: var(--node-drift-delay);
+          will-change: transform;
+        }
+
+        .node-button {
+          cursor: pointer;
+        }
+
+        .node-button:hover {
+          transform: translate(-50%, -50%) scale(1.07);
+        }
+
+        .node-button:active {
+          transform: translate(-50%, -50%) scale(0.97);
+        }
+
+        .node-focus {
+          cursor: default;
+        }
+
+        .node-focus:hover,
+        .node-focus:active {
+          transform: translate(-50%, -50%);
+        }
+
+        .corona {
+          position: absolute;
+          inset: -70%;
+          z-index: 0;
+          border-radius: 50%;
+          pointer-events: none;
+          background: radial-gradient(
+            circle closest-side,
+            color-mix(in oklab, var(--planet) 38%, transparent) 30%,
+            color-mix(in oklab, var(--planet) 12%, transparent) 58%,
+            transparent 100%
+          );
+          animation: corona-breathe 8s ease-in-out infinite;
+        }
+
+        .planet {
+          width: 100%;
+          height: 100%;
+          position: relative;
+          z-index: 1;
+          display: grid;
+          place-items: center;
+          overflow: hidden;
+          box-sizing: border-box;
+          padding: 0;
+          border: 0;
+          border-radius: 50%;
+          appearance: none;
+          background: radial-gradient(circle at 34% 30%, #2b2944, #0b0a17 72%);
+          color: var(--ink);
+          cursor: inherit;
+          box-shadow:
+            0 0 0 1px rgba(238, 234, 248, 0.1),
+            0 0 22px -4px color-mix(in oklab, var(--planet) 60%, transparent),
+            0 14px 30px rgba(0, 0, 0, 0.55);
+          transition:
+            box-shadow 520ms var(--ease-graph),
+            filter 420ms ease;
+        }
+
+        .planet:focus {
+          outline: none;
+        }
+
+        .planet:focus-visible {
+          outline: 1.5px solid var(--planet);
+          outline-offset: 7px;
+        }
+
+        .planet-image {
+          width: 100%;
+          height: 100%;
+          display: block;
+          pointer-events: none;
+          object-fit: cover;
+          border-radius: 50%;
+          transition: filter 420ms ease;
+        }
+
+        .planet-procedural {
+          position: absolute;
+          inset: 0;
+          border-radius: 50%;
+          pointer-events: none;
+        }
+
+        .planet-procedural-gas {
+          filter: blur(0.5px);
+          transform: scale(1.12);
+        }
+
+        .planet-shade {
+          position: absolute;
+          inset: 0;
+          border-radius: 50%;
+          pointer-events: none;
+          background:
+            radial-gradient(circle at 30% 24%, rgba(255, 255, 255, 0.16), rgba(255, 255, 255, 0) 38%),
+            radial-gradient(circle at 60% 64%, rgba(4, 4, 11, 0) 48%, rgba(4, 4, 11, 0.5) 92%);
+          box-shadow:
+            inset 0 0 0 1px color-mix(in oklab, var(--planet) 36%, transparent),
+            inset 2px 3px 8px -3px color-mix(in oklab, var(--planet) 70%, transparent);
+        }
+
+        .node-focus .planet {
+          box-shadow:
+            0 0 0 1px rgba(238, 234, 248, 0.18),
+            0 0 0 7px color-mix(in oklab, var(--planet) 10%, transparent),
+            0 0 70px 6px color-mix(in oklab, var(--planet) 42%, transparent),
+            0 18px 40px rgba(0, 0, 0, 0.6);
+        }
+
+        .node-child:hover .planet,
+        .node-child .planet:focus-visible {
+          box-shadow:
+            0 0 0 1px rgba(238, 234, 248, 0.22),
+            0 0 36px 2px color-mix(in oklab, var(--planet) 70%, transparent),
+            0 14px 30px rgba(0, 0, 0, 0.55);
+        }
+
+        .node-parent .planet-shade {
+          box-shadow:
+            inset 0 0 0 1px color-mix(in oklab, var(--ember) 60%, transparent),
+            inset 2px 3px 8px -3px color-mix(in oklab, var(--ember) 70%, transparent);
+        }
+
+        .node-parent .planet {
+          box-shadow:
+            0 0 0 1px rgba(238, 234, 248, 0.08),
+            0 0 22px -4px color-mix(in oklab, var(--ember) 50%, transparent),
+            0 14px 30px rgba(0, 0, 0, 0.55);
+        }
+
+        .node-ancestor {
+          opacity: 0.5;
+        }
+
+        .node-ancestor:hover {
+          opacity: 0.9;
+        }
+
+        .node-ancestor .planet-image {
+          filter: grayscale(0.7) brightness(0.8);
+        }
+
+        .node-ghost {
+          pointer-events: none;
+          opacity: 0;
+        }
+
+        .node-focus .planet:not(:disabled) {
+          cursor: pointer;
+        }
+
+        .satellite-orbit {
+          position: absolute;
+          inset: -14%;
+          z-index: 2;
+          border-radius: 50%;
+          pointer-events: none;
+          border: 1px solid color-mix(in oklab, var(--planet) 26%, transparent);
+          animation: node-spin 1.3s linear infinite;
+        }
+
+        .satellite {
+          width: 6px;
+          height: 6px;
+          position: absolute;
+          top: -3.5px;
+          left: calc(50% - 3px);
+          border-radius: 50%;
+          background: var(--ink);
+          box-shadow: 0 0 10px 2px color-mix(in oklab, var(--planet) 80%, transparent);
+        }
+
+        .node-name {
+          width: 240%;
+          position: absolute;
+          top: calc(100% + 12px);
+          left: 50%;
+          z-index: 1;
+          display: grid;
+          gap: 1px;
+          pointer-events: none;
+          transform: translateX(-50%) scale(var(--node-text-scale));
+          transform-origin: top center;
+          color: rgba(238, 234, 248, 0.78);
+          font: 500 12.5px/1.15 var(--font-ui);
+          letter-spacing: 0.01em;
+          text-align: center;
+          text-shadow: 0 1px 12px rgba(4, 4, 11, 0.95);
+          transition:
+            color 300ms ease,
+            transform 520ms var(--ease-graph);
+        }
+
+        .node-focus .node-name {
+          width: 340%;
+          top: calc(100% + 16px);
+          color: var(--ink);
+          font: 500 36px/1 var(--font-display);
+          letter-spacing: -0.01em;
+          text-wrap: balance;
+          text-shadow: 0 2px 24px rgba(4, 4, 11, 0.9);
+        }
+
+        .node-child .node-name {
+          color: rgba(238, 234, 248, 0.86);
+        }
+
+        .node-label-side .node-name {
+          width: max-content;
+          top: 50%;
+          left: calc(100% + 12px);
+          transform: translateY(-50%) scale(var(--node-text-scale));
+          transform-origin: left center;
+          text-align: left;
+        }
+
+        .node-child:hover .node-name {
+          color: #fff;
+        }
+
+        .node-parent .node-name {
+          color: color-mix(in oklab, var(--ember) 70%, white);
+        }
+
+        .hud-route {
+          max-width: min(760px, calc(100vw - 56px));
+          position: fixed;
+          top: max(24px, env(safe-area-inset-top));
+          left: 28px;
+          z-index: 4;
+        }
+
+        .hud-eyebrow {
+          margin: 0;
+          color: var(--dust);
+          font: 500 10.5px/1 var(--font-mono);
+          letter-spacing: 0.2em;
+          text-transform: uppercase;
+        }
+
+        .route {
+          margin: 10px 0 0 -6px;
+          padding: 0;
+          display: flex;
+          flex-wrap: wrap;
+          align-items: center;
+          gap: 2px;
+          list-style: none;
+          font: 500 13.5px/1.2 var(--font-ui);
+        }
+
+        .route-stop {
+          display: flex;
+          align-items: center;
+          gap: 2px;
+        }
+
+        .route-stop + .route-stop::before {
+          content: "";
+          width: 16px;
+          height: 1px;
+          margin: 0 2px;
+          background: linear-gradient(90deg, transparent, color-mix(in oklab, var(--ember) 55%, transparent), transparent);
+        }
+
+        .route-link,
+        .route-here {
+          padding: 5px 6px;
+          border-radius: 6px;
+          font: inherit;
+          white-space: nowrap;
+        }
+
+        .route-link {
+          border: 0;
+          background: transparent;
+          color: rgba(238, 234, 248, 0.56);
+          cursor: pointer;
+          transition:
+            color 160ms ease,
+            background 160ms ease;
+        }
+
+        .route-link:hover {
+          color: var(--ink);
+          background: rgba(238, 234, 248, 0.06);
+        }
+
+        .route-link:focus-visible {
+          outline: 1.5px solid var(--aura);
+          outline-offset: 1px;
+        }
+
+        .route-here {
+          color: var(--ink);
+          font-weight: 700;
+        }
+
+        .route-gap {
+          padding: 0 4px;
+          color: var(--dust);
+        }
+
+        .hud-hint {
+          margin: 6px 0 0;
+          color: var(--dust);
+          font-size: 12.5px;
+          line-height: 1.4;
+        }
+
+        .hud-empty {
+          max-width: 340px;
+          margin: 8px 0 0;
+          color: color-mix(in oklab, var(--ember) 70%, white);
+          font-size: 12.5px;
+          line-height: 1.4;
+        }
+
+        .hud-credit {
+          position: fixed;
+          right: 20px;
+          bottom: max(20px, env(safe-area-inset-bottom));
+          z-index: 4;
+          display: flex;
+          align-items: center;
+          gap: 5px;
+          margin: 0;
+          color: rgba(238, 234, 248, 0.5);
+          font: 500 10px/1 var(--font-ui);
+          letter-spacing: 0.02em;
+        }
+
+        .hud-credit-mark {
+          width: 11px;
+          height: 11px;
+          display: block;
+        }
+
+        .sr-only {
+          width: 1px;
+          height: 1px;
+          position: absolute;
+          overflow: hidden;
+          clip: rect(0, 0, 0, 0);
+          white-space: nowrap;
+        }
+
+        .artist-picker {
+          width: min(440px, calc(100vw - 32px));
+          position: fixed;
+          bottom: max(24px, env(safe-area-inset-bottom));
+          left: 50%;
+          z-index: 7;
+          transform: translateX(-50%);
+        }
+
+        .search-dim-overlay {
+          position: fixed;
+          inset: 0;
+          z-index: 5;
+          pointer-events: none;
+          background: rgba(4, 4, 11, 0.6);
+          opacity: 0;
+          transition: opacity 220ms ease;
+        }
+
+        .artist-picker:focus-within + .search-dim-overlay {
+          opacity: 1;
+        }
+
+        .artist-search-control {
+          height: 50px;
+          display: flex;
+          align-items: center;
+          gap: 12px;
+          box-sizing: border-box;
+          padding: 0 10px 0 18px;
+          border: 1px solid rgba(238, 234, 248, 0.12);
+          border-radius: 999px;
+          background: rgba(9, 9, 24, 0.6);
+          box-shadow:
+            0 20px 50px rgba(0, 0, 0, 0.45),
+            inset 0 1px 0 rgba(255, 255, 255, 0.05);
+          backdrop-filter: blur(18px) saturate(1.2);
+          cursor: text;
+          transition:
+            border-color 200ms ease,
+            box-shadow 200ms ease,
+            background 200ms ease;
+        }
+
+        .artist-picker:hover .artist-search-control {
+          border-color: rgba(238, 234, 248, 0.2);
+        }
+
+        .artist-picker:focus-within .artist-search-control {
+          border-color: color-mix(in oklab, var(--aura) 55%, transparent);
+          background: rgba(9, 9, 24, 0.86);
+          box-shadow:
+            0 24px 60px rgba(0, 0, 0, 0.55),
+            0 0 0 4px color-mix(in oklab, var(--aura) 12%, transparent);
+        }
+
+        .artist-search-icon {
+          width: 15px;
+          height: 15px;
+          flex: 0 0 auto;
+          position: relative;
+          color: var(--dust);
+        }
+
+        .artist-search-icon::before {
+          content: "";
+          width: 10px;
+          height: 10px;
+          position: absolute;
+          top: 0;
+          left: 0;
+          box-sizing: border-box;
+          border: 1.5px solid currentColor;
+          border-radius: 50%;
+        }
+
+        .artist-search-icon::after {
+          content: "";
+          width: 6px;
+          height: 1.5px;
+          position: absolute;
+          right: 0;
+          bottom: 2px;
+          border-radius: 999px;
+          background: currentColor;
+          transform: rotate(45deg);
+        }
+
+        .artist-search-input {
+          min-width: 0;
+          flex: 1;
+          border: 0;
+          outline: 0;
+          background: transparent;
+          color: var(--ink);
+          font: 500 14px/1 var(--font-ui);
+        }
+
+        .artist-search-input::placeholder {
+          color: var(--dust);
+        }
+
+        .artist-search-input::-webkit-search-cancel-button {
+          display: none;
+        }
+
+        .search-kbd {
+          flex: 0 0 auto;
+          padding: 6px 9px;
+          border: 1px solid rgba(238, 234, 248, 0.1);
+          border-radius: 999px;
+          color: var(--dust);
+          font: 500 10.5px/1 var(--font-mono);
+          letter-spacing: 0.06em;
+        }
+
+        .artist-picker:focus-within .search-kbd {
+          opacity: 0;
+        }
+
+        .artist-search-panel {
+          width: 100%;
+          max-height: min(400px, 56vh);
+          position: absolute;
+          bottom: calc(100% + 10px);
+          left: 0;
+          overflow: auto;
+          box-sizing: border-box;
+          padding: 6px;
+          border: 1px solid rgba(238, 234, 248, 0.1);
+          border-radius: 22px;
+          background: rgba(9, 9, 24, 0.84);
+          box-shadow: 0 24px 60px rgba(0, 0, 0, 0.5);
+          backdrop-filter: blur(20px) saturate(1.2);
+          animation: panel-rise 220ms var(--ease-graph) both;
+        }
+
+        .artist-search-message {
+          padding: 14px 14px 12px;
+          color: var(--dust);
+          font-size: 13px;
+          font-weight: 500;
+          line-height: 1.35;
+        }
+
+        .artist-search-message-error {
+          color: #ffd2bf;
+        }
+
+        .artist-search-result {
+          width: 100%;
+          display: flex;
+          align-items: center;
+          gap: 12px;
+          padding: 7px 8px;
+          border: 0;
+          border-radius: 16px;
+          background: transparent;
+          color: var(--ink);
+          cursor: pointer;
+          text-align: left;
+          transition:
+            background 150ms ease,
+            transform 140ms var(--ease-graph);
+        }
+
+        .artist-search-result:hover,
+        .artist-search-result:focus-visible {
+          outline: none;
+          background: rgba(238, 234, 248, 0.07);
+        }
+
+        .artist-search-result[aria-selected="true"] {
+          background: color-mix(in oklab, var(--aura) 14%, transparent);
+        }
+
+        .artist-search-result:active {
+          transform: scale(0.985);
+        }
+
+        .artist-search-result:disabled {
+          cursor: default;
+          opacity: 0.7;
+        }
+
+        .artist-search-result-media {
+          width: 40px;
+          height: 40px;
+          position: relative;
+          flex: 0 0 auto;
+          display: grid;
+          place-items: center;
+          overflow: hidden;
+          border-radius: 50%;
+          background: radial-gradient(circle at 34% 30%, #2b2944, #0b0a17 72%);
+          box-shadow: 0 0 0 1px rgba(238, 234, 248, 0.1);
+          color: var(--ink);
+          font: 500 15px/1 var(--font-display);
+        }
+
+        .artist-search-result-image {
+          width: 100%;
+          height: 100%;
+          display: block;
+          object-fit: cover;
+        }
+
+        .artist-search-result-copy {
+          min-width: 0;
+          display: grid;
+          gap: 4px;
+        }
+
+        .artist-search-result-name {
+          overflow: hidden;
+          font-size: 14px;
+          font-weight: 500;
+          line-height: 1.15;
+          text-overflow: ellipsis;
+          white-space: nowrap;
+        }
+
+        .artist-search-result-meta {
+          color: var(--dust);
+          font: 500 10px/1 var(--font-mono);
+          letter-spacing: 0.16em;
+          text-transform: uppercase;
+        }
+
+        .load-error {
+          width: max-content;
+          max-width: min(520px, calc(100vw - 40px));
+          position: fixed;
+          bottom: 92px;
+          left: 50%;
+          z-index: 6;
+          box-sizing: border-box;
+          margin: 0;
+          padding: 10px 16px;
+          transform: translateX(-50%);
+          border: 1px solid color-mix(in oklab, var(--ember) 30%, transparent);
+          border-radius: 14px;
+          background: rgba(22, 10, 14, 0.72);
+          color: #ffd9c7;
+          font-size: 12.5px;
+          font-weight: 500;
+          line-height: 1.45;
+          text-align: center;
+          backdrop-filter: blur(14px);
+        }
+
+        @keyframes node-spin {
+          to {
+            transform: rotate(360deg);
+          }
+        }
+
+        @keyframes orbit-spin {
+          to {
+            transform: rotate(360deg);
+          }
+        }
+
+        @keyframes node-drift {
+          0%,
+          100% {
+            transform: translate3d(var(--node-drift-x-a), var(--node-drift-y-a), 0);
+          }
+
+          50% {
+            transform: translate3d(var(--node-drift-x-b), var(--node-drift-y-b), 0);
+          }
+        }
+
+        @keyframes node-emerge {
+          from {
+            opacity: 0;
+            transform: translate(var(--emerge-x), var(--emerge-y)) scale(0.2);
+            filter: blur(8px);
+          }
+
+          55% {
+            opacity: 1;
+            filter: blur(0);
+          }
+
+          to {
+            opacity: 1;
+            transform: none;
+            filter: none;
+          }
+        }
+
+        @keyframes corona-breathe {
+          0%,
+          100% {
+            opacity: 0.8;
+            transform: scale(0.96);
+          }
+
+          50% {
+            opacity: 1;
+            transform: scale(1.05);
+          }
+        }
+
+        @keyframes nebula-breathe {
+          from {
+            scale: 1;
+            opacity: 0.85;
+          }
+
+          to {
+            scale: 1.08;
+            opacity: 1;
+          }
+        }
+
+        @keyframes panel-rise {
+          from {
+            opacity: 0;
+            transform: translateY(6px);
+          }
+        }
+
+        @media (prefers-reduced-motion: reduce) {
+          .node-float,
+          .node-emerge,
+          .corona,
+          .nebula,
+          .orbit-ring,
+          .artist-search-panel {
+            animation: none;
+          }
+
+          .cosmos {
+            transition: none;
+          }
+        }
+
+        @media (max-width: 640px) {
+          .graph-frame {
+            width: min(100vw, 78vh);
+          }
+
+          .hud-route {
+            max-width: calc(100vw - 32px);
+            top: max(16px, env(safe-area-inset-top));
+            left: 16px;
+          }
+
+          .route {
+            font-size: 12.5px;
+          }
+
+          .hud-hint {
+            display: none;
+          }
+
+          .hud-credit {
+            right: 50%;
+            bottom: calc(max(24px, env(safe-area-inset-bottom)) + 58px);
+            transform: translateX(50%);
+            white-space: nowrap;
+          }
+
+          .load-error {
+            bottom: 140px;
+          }
+
+          .node-name {
+            font-size: 11.5px;
+          }
+
+          .node-focus .node-name {
+            font-size: 28px;
+          }
+
+          .search-kbd {
+            display: none;
+          }
+        }
+      `}</style>
+
+      <Starfield camera={camera} />
+      <div aria-hidden="true" className="nebula" style={{ transform: `translate3d(${(-cameraDriftX * 0.05).toFixed(1)}px, ${(-cameraDriftY * 0.05).toFixed(1)}px, 0)` }} />
+
+      <section aria-label="Map of related artists" className="graph-stage">
+        <div className="graph-frame">
+          <svg aria-hidden="true" className="graph-svg" viewBox={`0 0 ${SIZE} ${SIZE}`}>
+            <g transform={`translate(${camera.x} ${camera.y}) scale(${camera.scale})`}>
+              <g>
+                {orbitRings.map((ring) => (
+                  <circle
+                    className={`orbit-ring orbit-ring-${ring.role}`}
+                    cx={ring.x}
+                    cy={ring.y}
+                    key={ring.id}
+                    r={ring.radius}
+                    style={{ animationDuration: `${Math.round(ring.radius * 0.45)}s` }}
+                  />
+                ))}
+              </g>
+
+              <g>
+                {edges.map((edge) => (
+                  <line className={`edge edge-${edge.role}`} key={edge.id} x1={edge.parent.x} y1={edge.parent.y} x2={edge.child.x} y2={edge.child.y} />
+                ))}
+                {previewEdges.map((edge) => (
+                  <line
+                    className={`edge edge-preview${edge.parentId === hoveredId ? " edge-preview-lit" : ""}`}
+                    key={edge.id}
+                    x1={edge.x1}
+                    y1={edge.y1}
+                    x2={edge.x2}
+                    y2={edge.y2}
+                  />
+                ))}
+              </g>
+            </g>
+          </svg>
+          <div className="node-html-layer">
+            <div className="node-world" style={cameraStyle(camera)}>
+              {renderedNodes.map((node) => {
+                const role = roles.get(node.id) ?? "ghost";
+                const radius = nodeRadius(role, node, focusedNode);
+                const isInteractive =
+                  !isTraveling && isInteractiveRole(role) && (role !== "focus" || node.childrenStatus === "error") && node.childrenStatus !== "loading";
+
+                return renderArtistNode(node, role, radius, camera.scale, { interactive: isInteractive });
+              })}
             </div>
-            {!auth.isLoading && auth.isGuest ? (
-              <SignInWithGoogle className="shrink-0 border border-neutral-700 px-3 py-1.5 text-sm font-medium text-neutral-200 hover:border-white hover:text-white" />
-            ) : !auth.isLoading ? (
-              <button className="shrink-0 text-sm text-neutral-400 hover:text-white" type="button" onClick={() => signOut()}>
-                Sign out
-              </button>
-            ) : null}
           </div>
-          <nav className="mb-8 flex gap-4 text-sm text-neutral-400">
-            <Link className="hover:text-white" to="/">Todos</Link>
-            <Link className="hover:text-white" to="/status">Status</Link>
-          </nav>
-          <Routes>
-            <Route path="/" element={<TodoPage />} />
-            <Route path="/status" element={<StatusPage />} />
-            <Route path="*" element={<section><h1 className="mb-4 text-4xl font-bold">Not found</h1><Link className="text-neutral-300 hover:text-white" to="/">Back to todos</Link></section>} />
-          </Routes>
-        </section>
-      </main>
-    </Router>
+        </div>
+      </section>
+
+      <div aria-hidden="true" className="fog" />
+
+      <nav aria-label="Your route" className="hud-route">
+        <p className="hud-eyebrow">{jumps === 0 ? "Starting point" : `Route · ${jumps} ${jumps === 1 ? "jump" : "jumps"}`}</p>
+        <ol className="route">
+          {visibleRoute.map((stop, index) =>
+            stop ? (
+              <li className="route-stop" key={stop.id}>
+                {stop.id === cameraFocusedNode.id ? (
+                  <span aria-current="location" className="route-here">
+                    {stop.label}
+                  </span>
+                ) : (
+                  <button className="route-link" disabled={isTraveling} onClick={() => void focusNode(stop.id)} type="button">
+                    {stop.label}
+                  </button>
+                )}
+              </li>
+            ) : (
+              <li className="route-stop" key={`gap-${index}`}>
+                <span className="route-gap">…</span>
+              </li>
+            )
+          )}
+        </ol>
+        {isDeadEnd ? (
+          <p className="hud-empty">Deezer has no related artists for {cameraFocusedNode.label}. Go back a step or search for someone else.</p>
+        ) : jumps === 0 ? (
+          <p className="hud-hint">Pick an orbiting artist to travel to them.</p>
+        ) : null}
+      </nav>
+
+      <p className="hud-credit">
+        <img alt="" className="hud-credit-mark" src={DEEZER_MARK} />
+        Deezer
+      </p>
+
+      <form className="artist-picker" onSubmit={handleArtistSearchSubmit}>
+        <label className="sr-only" htmlFor="core-artist-search">
+          Start from another artist
+        </label>
+        <div className="artist-search-control" onClick={() => focusArtistSearchInput()}>
+          <span aria-hidden="true" className="artist-search-icon" />
+          <input
+            aria-autocomplete="list"
+            aria-controls="core-artist-search-results"
+            aria-expanded={showArtistSearchPanel}
+            autoComplete="off"
+            className="artist-search-input"
+            id="core-artist-search"
+            onFocus={() => setIsArtistPickerOpen(true)}
+            onInput={(event) => {
+              setArtistSearchText((event.currentTarget as HTMLInputElement).value);
+              setIsArtistPickerOpen(true);
+            }}
+            onKeyDown={handleArtistSearchKeyDown}
+            placeholder="Start from another artist"
+            ref={artistSearchInputRef}
+            type="search"
+            value={artistSearchText}
+          />
+          <kbd aria-hidden="true" className="search-kbd">
+            ⌘K
+          </kbd>
+        </div>
+
+        {showArtistSearchPanel ? (
+          <div className="artist-search-panel" id="core-artist-search-results" role="listbox">
+            {artistSearchStatus === "searching" ? <div className="artist-search-message">Searching Deezer…</div> : null}
+            {artistSearchStatus === "error" ? <div className="artist-search-message artist-search-message-error">{artistSearchError}</div> : null}
+            {artistSearchStatus === "idle" && trimmedArtistSearchText.length >= 2 && artistSearchResults.length === 0 ? (
+              <div className="artist-search-message">No artists match “{trimmedArtistSearchText}”. Try a different spelling.</div>
+            ) : null}
+            {artistSearchResults.map((artist) => (
+              <button
+                aria-selected={artist.id === coreArtistId}
+                className="artist-search-result"
+                disabled={rootLoadId === artist.id}
+                key={artist.id}
+                onClick={() => void chooseCoreArtist(artist)}
+                role="option"
+                type="button"
+              >
+                <span className="artist-search-result-media">
+                  {artist.imageUrl ? <img alt="" className="artist-search-result-image" crossOrigin="anonymous" draggable={false} src={artist.imageUrl} /> : <ProceduralPlanet seed={artist.id} />}
+                </span>
+                <span className="artist-search-result-copy">
+                  <span className="artist-search-result-name">{artist.name}</span>
+                  <span className="artist-search-result-meta">{artist.id === coreArtistId ? "Current start" : formatFans(artist.fans)}</span>
+                </span>
+              </button>
+            ))}
+          </div>
+        ) : null}
+      </form>
+      <div aria-hidden="true" className="search-dim-overlay" />
+
+      {loadError ? (
+        <p className="load-error" role="alert">
+          {loadError}
+        </p>
+      ) : null}
+    </main>
   );
 }
