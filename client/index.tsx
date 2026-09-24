@@ -276,9 +276,13 @@ function attachChildren(tree: TreeState, parentId: string, artists: ArtistSummar
   return nextTree;
 }
 
-function createInitialTree() {
+function createInitialTree(): TreeState {
   const core = makeRootNode(kendrickLamarFallback);
-  return { [core.id]: core };
+  const tree = { [core.id]: core };
+  const cached = typeof window === "undefined" ? undefined : readCachedNeighborhood(kendrickLamarFallback.id);
+
+  // A returning visitor sees the starting neighborhood instantly instead of waiting on the query.
+  return cached ? attachChildren(updateNodeArtist(tree, core.id, cached), core.id, cached.related) : tree;
 }
 
 // Only your route and the focused artist's orbit are visible; everything else stays in the fog.
@@ -826,6 +830,95 @@ function setNodePreviews(tree: TreeState, nodeId: string, previews: TrackPreview
   return node ? { ...tree, [nodeId]: { ...node, previews } } : tree;
 }
 
+// Artist data is remembered in the browser so revisits (even days later) skip the network. Every load
+// counts against Lakebed's daily mutation limit, so this is what keeps reloads and repeat visits free.
+// Related-artist lists change slowly; preview URLs expire within the hour and are refreshed on play.
+const ARTIST_CACHE_PREFIX = "drift:artist:v1:";
+const ARTIST_CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+const ARTIST_CACHE_MAX_ENTRIES = 400;
+
+type CachedNeighborhood = { savedAt: number; data: ArtistNeighborhood };
+
+function readCachedNeighborhood(artistId: string) {
+  try {
+    const raw = window.localStorage.getItem(ARTIST_CACHE_PREFIX + artistId);
+    if (!raw) {
+      return undefined;
+    }
+
+    const entry = JSON.parse(raw) as CachedNeighborhood;
+    const isComplete = Boolean(entry?.data?.artist) && Array.isArray(entry.data.related) && Array.isArray(entry.data.previews);
+    if (!isComplete || !(Date.now() - entry.savedAt <= ARTIST_CACHE_TTL_MS)) {
+      window.localStorage.removeItem(ARTIST_CACHE_PREFIX + artistId);
+      return undefined;
+    }
+
+    return entry.data;
+  } catch {
+    return undefined;
+  }
+}
+
+function evictCachedNeighborhoods(keep: number) {
+  const entries: { key: string; savedAt: number }[] = [];
+
+  for (let index = 0; index < window.localStorage.length; index += 1) {
+    const key = window.localStorage.key(index);
+    if (!key?.startsWith(ARTIST_CACHE_PREFIX)) {
+      continue;
+    }
+
+    let savedAt = 0;
+    try {
+      savedAt = (JSON.parse(window.localStorage.getItem(key) ?? "{}") as Partial<CachedNeighborhood>).savedAt ?? 0;
+    } catch {
+      // Unreadable entries sort first and get evicted.
+    }
+
+    entries.push({ key, savedAt });
+  }
+
+  entries
+    .sort((first, second) => first.savedAt - second.savedAt)
+    .slice(0, Math.max(0, entries.length - keep))
+    .forEach((entry) => window.localStorage.removeItem(entry.key));
+}
+
+function writeCachedNeighborhood(artistId: string, data: ArtistNeighborhood) {
+  const value = JSON.stringify({ savedAt: Date.now(), data } satisfies CachedNeighborhood);
+
+  try {
+    window.localStorage.setItem(ARTIST_CACHE_PREFIX + artistId, value);
+  } catch {
+    // Storage full: drop the older half and try once more; if that fails, just skip caching.
+    try {
+      evictCachedNeighborhoods(Math.floor(ARTIST_CACHE_MAX_ENTRIES / 2));
+      window.localStorage.setItem(ARTIST_CACHE_PREFIX + artistId, value);
+    } catch {
+      return;
+    }
+  }
+
+  // Counting keys is cheap; only parse and evict once the cache is actually over its cap.
+  let count = 0;
+  for (let index = 0; index < window.localStorage.length; index += 1) {
+    if (window.localStorage.key(index)?.startsWith(ARTIST_CACHE_PREFIX)) {
+      count += 1;
+    }
+  }
+
+  if (count > ARTIST_CACHE_MAX_ENTRIES) {
+    evictCachedNeighborhoods(ARTIST_CACHE_MAX_ENTRIES);
+  }
+}
+
+function updateCachedPreviews(artistId: string, previews: TrackPreview[]) {
+  const cached = readCachedNeighborhood(artistId);
+  if (cached) {
+    writeCachedNeighborhood(artistId, { ...cached, previews });
+  }
+}
+
 // Two decks so one artist's preview can fade out while the next fades in. Audio runs through Web Audio:
 // gain ramps work on iOS (which ignores element.volume), and the analyser drives the focused planet's
 // pulse. Deezer serves previews with CORS headers, which Web Audio needs in order to hear them.
@@ -1119,9 +1212,11 @@ export function App() {
       engine.stop();
       setNowPlaying(undefined);
       const nodeId = playingNode.id;
-      void loadArtistPreviews(playingNode.artistId)
+      const artistId = playingNode.artistId;
+      void loadArtistPreviews(artistId)
         .then((result) => {
           if (result.ok) {
+            updateCachedPreviews(artistId, result.data);
             setTree((currentTree) => setNodePreviews(currentTree, nodeId, result.data));
           }
         })
@@ -1310,7 +1405,15 @@ export function App() {
     }
 
     setLoadError(undefined);
-    setTree((currentTree) => attachChildren(updateNodeArtist(currentTree, rootNode.id, artistRoot.data), rootNode.id, artistRoot.data.related));
+    writeCachedNeighborhood(kendrickLamarFallback.id, artistRoot.data);
+    setTree((currentTree) => {
+      // Already filled in from the browser cache: keep the map as-is; the fresh data is saved for next time.
+      if (currentTree[rootNode.id]?.childrenStatus === "loaded" && getChildren(currentTree, currentTree[rootNode.id]).length > 0) {
+        return currentTree;
+      }
+
+      return attachChildren(updateNodeArtist(currentTree, rootNode.id, artistRoot.data), rootNode.id, artistRoot.data.related);
+    });
   }, [artistRoot, coreArtistId]);
 
   useEffect(() => {
@@ -1336,7 +1439,12 @@ export function App() {
 
   // Background loads run one at a time; a priority request (hover or click) starts immediately and the
   // queue simply reuses its result when that artist's turn comes up.
-  function requestNeighborhood(artistId: string, priority: boolean) {
+  function requestNeighborhood(artistId: string, priority: boolean): Promise<ArtistNeighborhoodResult> {
+    const cached = readCachedNeighborhood(artistId);
+    if (cached) {
+      return Promise.resolve({ ok: true, data: cached });
+    }
+
     let entry = neighborhoodRequestsRef.current.get(artistId);
 
     if (!entry) {
@@ -1349,7 +1457,13 @@ export function App() {
           }
 
           started = true;
-          loadRelatedArtists(artistId).then(resolve, (error: unknown) =>
+          loadRelatedArtists(artistId).then((result) => {
+            if (result.ok) {
+              writeCachedNeighborhood(artistId, result.data);
+            }
+
+            resolve(result);
+          }, (error: unknown) =>
             resolve({
               ok: false,
               error: error instanceof Error ? error.message : "Unable to load artist data from Deezer."
@@ -1520,8 +1634,12 @@ export function App() {
     setTree({ [loadingCore.id]: loadingCore });
 
     let result: ArtistNeighborhoodResult;
+    const cachedRoot = readCachedNeighborhood(artist.id);
     try {
-      result = await loadRootArtist(artist.id);
+      result = cachedRoot ? { ok: true, data: cachedRoot } : await loadRootArtist(artist.id);
+      if (result.ok && !cachedRoot) {
+        writeCachedNeighborhood(artist.id, result.data);
+      }
     } catch (error) {
       result = {
         ok: false,
